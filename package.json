@@ -1,0 +1,27 @@
+{
+  "name": "dormiostay",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/web"
+  ],
+  "engines": {
+    "node": ">=24.21.0 <25",
+    "npm": ">=11 <12"
+  },
+  "scripts": {
+    "dev:web": "npm run dev --workspace @dormiostay/web",
+    "build": "npm run build --workspace @dormiostay/web",
+    "lint": "npm run lint --workspace @dormiostay/web",
+    "typecheck": "npm run typecheck --workspace @dormiostay/web",
+    "test": "npm run test --workspace @dormiostay/web",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "3.10.1"
+  },
+  "overrides": {
+    "minimatch": "11.0.8"
+  }
+}

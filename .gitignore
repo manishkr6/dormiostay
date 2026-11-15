@@ -1,0 +1,33 @@
+# Local secrets (keep the names-only template).
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python environments, caches, and build output.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.uv-cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Node, tests, and builds.
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+playwright-report/
+test-results/
+
+# Local machine and editor files.
+.DS_Store
+.idea/
+.vscode/
+*.log

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+.venv/
+.uv-cache/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+# Source specifications are preserved verbatim.
+docs/
+apps/api/uv.lock
+package-lock.json
