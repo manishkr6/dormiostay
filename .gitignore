@@ -4,6 +4,18 @@
 !.env.example
 *.pem
 *.key
+*.p12
+*.pfx
+*.secret
+.secrets/
+*.dump
+*.backup
+*.sql.gz
+*.sql.bz2
+*.sql.xz
+*.db
+*.sqlite
+*.sqlite3
 
 # Python environments, caches, and build output.
 .venv/

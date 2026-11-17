@@ -2,9 +2,9 @@
 
 PG, hostel, and student accommodation marketplace for ICFAI University Sikkim and Gangtok.
 
-This is the **T-01 tooling foundation**. It contains an empty FastAPI app and a minimal
-React page so both development servers and test runners can be verified. Product
-features are built ticket by ticket, with review between tickets.
+This is the DormioStay foundation. It contains the T-02 FastAPI runtime skeleton
+and a minimal React page so both development servers and test runners can be
+verified. Product features are built ticket by ticket, with review between tickets.
 
 ## Requirements
 
@@ -50,7 +50,8 @@ uv run --no-sync uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 Visit <http://127.0.0.1:8000/docs> or <http://127.0.0.1:8000/openapi.json>.
-The schema has no application routes yet. `/` returns FastAPI's default 404.
+`/healthz` is the dependency-free liveness endpoint and `/readyz` checks the
+configured database. The application routes are mounted below `/api/v1`.
 
 Terminal 2, from the repository root:
 
@@ -65,9 +66,11 @@ with Ctrl+C. T-01 does not require database, Redis, email, or AI credentials.
 
 `.env.example` lists **every variable from Technical Architecture section 6**,
 with a comment and a blank value, grouped into backend and frontend sections.
-The bootstrap does not load backend configuration yet; that belongs to T-02.
-When configuring later tickets, copy only the relevant section into
-`apps/api/.env` or `apps/web/.env.local`. Both locations are ignored by Git.
+T-02 validates `APP_ENV`, `DATABASE_URL`, and `FRONTEND_ORIGIN` at API startup;
+missing required values stop startup with a clear validation error. Copy the
+backend variables into `apps/api/.env` or export them in the API terminal, and
+copy the frontend variables into `apps/web/.env.local`. Both locations are
+ignored by Git. For local Compose, use the root `.env` as documented above.
 
 Never commit credentials or reuse production secrets locally. Only
 `VITE_SITE_URL`, `VITE_GEOAPIFY_MAP_KEY`, `VITE_SENTRY_DSN`, and

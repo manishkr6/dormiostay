@@ -9,4 +9,5 @@ def test_empty_api_starts() -> None:
 
     assert response.status_code == 200
     assert response.json()["info"]["title"] == "DormioStay API"
-    assert response.json()["paths"] == {}
+    assert "/healthz" in response.json()["paths"]
+    assert "/readyz" in response.json()["paths"]

@@ -5,7 +5,10 @@ description = "DormioStay API"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi==0.141.1",
+    "asyncpg==0.30.0",
     "pydantic==2.13.5",
+    "pydantic-settings==2.10.1",
+    "sentry-sdk[fastapi]==2.46.0",
     "uvicorn==0.52.4",
 ]
 
