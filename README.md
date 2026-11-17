@@ -111,13 +111,15 @@ from automatic formatting to preserve their contents.
 ## Optional local Postgres and Redis
 
 Neither service is needed for the empty apps. To start them later, first start
-Docker Desktop/Engine. From the repository root, generate a local-only database
-password in your shell, then start Compose:
+Docker Desktop/Engine. From the repository root, copy `.env.example` to the
+gitignored `.env`, set a local-only password, then start Compose:
 
 ```sh
-export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
-docker compose up -d --wait
-docker compose ps
+cp .env.example .env
+openssl rand -hex 24
+# Put the generated value in POSTGRES_PASSWORD in .env.
+docker compose --project-name dormiostay up -d --wait
+docker compose --project-name dormiostay ps
 ```
 
 `POSTGRES_PASSWORD` is a Compose-only setup variable, separate from the
@@ -126,15 +128,17 @@ when reusing the database volume; changing the environment value does not change
 the password inside an existing database.
 
 Postgres uses database `dormiostay` and bootstrap user `dormiostay_local_admin`
-on `127.0.0.1:5432`. This administrative user is for local setup only; the future
+on `127.0.0.1:5433`. This administrative user is for local setup only; the future
 application role must be a separate non-superuser without RLS bypass. Redis is
-available on `127.0.0.1:6379`. Ports are bound to loopback only.
+available on `127.0.0.1:6380`. Both services use the dedicated `dormiostay`
+network and dedicated persistent volumes. Ports are bound to loopback only.
 
 ```sh
-docker compose down
+docker compose --project-name dormiostay down
 ```
 
-This stops the services and preserves the named Postgres volume.
+This stops the services and preserves both named volumes. Do not add `-v` unless
+you separately intend to delete the local database and Redis data.
 
 ## Repository map and project rules
 

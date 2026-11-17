@@ -1,28 +1,50 @@
-# Optional development infrastructure. No application data model is created yet.
+name: dormiostay
+
 services:
   postgres:
-    image: postgres:17.6-alpine
+    image: postgres:16-alpine
     environment:
-      POSTGRES_DB: dormiostay
-      POSTGRES_USER: dormiostay_local_admin
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a local-only POSTGRES_PASSWORD in your shell}
+      POSTGRES_DB: ${POSTGRES_DB:-dormiostay}
+      POSTGRES_USER: ${POSTGRES_USER:-dormiostay_local_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
-      - '127.0.0.1:5432:5432'
+      - '127.0.0.1:5433:5432'
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - dormiostay_postgres_data:/var/lib/postgresql/data
+    networks:
+      - dormiostay
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U dormiostay_local_admin -d dormiostay']
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
   redis:
-    image: redis:7.4.2-alpine
+    image: redis:7-alpine
+    command: ['redis-server', '--save', '60', '1', '--appendonly', 'yes']
     ports:
-      - '127.0.0.1:6379:6379'
+      - '127.0.0.1:6380:6379'
+    volumes:
+      - dormiostay_redis_data:/data
+    networks:
+      - dormiostay
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+networks:
+  dormiostay:
+    name: dormiostay
+    driver: bridge
+
 volumes:
-  postgres_data:
+  dormiostay_postgres_data:
+    name: dormiostay_postgres_data
+  dormiostay_redis_data:
+    name: dormiostay_redis_data
