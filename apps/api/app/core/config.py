@@ -17,10 +17,13 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        hide_input_in_errors=True,
     )
 
     app_env: AppEnvironment = Field(..., description="Runtime environment")
-    database_url: str = Field(..., min_length=1, description="Pooled application database URL")
+    database_url: str = Field(
+        ..., min_length=1, repr=False, description="Pooled application database URL"
+    )
     frontend_origin: AnyHttpUrl = Field(..., description="Exact browser origin allowed by CORS")
     sentry_dsn: str | None = Field(default=None, min_length=1)
     request_id_header: str = Field(default="X-Request-ID", min_length=1)

@@ -83,6 +83,56 @@ the application and a direct URL for migrations, with separate roles.
 
 ## Checks
 
+### T-03 database migrations and sessions
+
+From `apps/api`, install the updated Python dependencies using the installation
+steps above. Set `DATABASE_URL` to the pooled application connection and
+`DATABASE_URL_DIRECT` to the direct migration-owner connection. Store credentials
+in a gitignored environment file or your environment, never in alembic.ini.
+
+For T-03 verification, Alembic requires `TEST_DATABASE_NAME` and a
+`DATABASE_URL_DIRECT` pointing to that explicitly approved local disposable
+database. Direct migration commands targeting the development database are
+blocked. Authorizing deployment migrations is a separate future step.
+
+Provision a separate application login with NOSUPERUSER, NOBYPASSRLS,
+NOCREATEDB and NOCREATEROLE, without membership in privileged roles.
+It must not own the schema or tables. As the migration owner, use
+`psql "$DATABASE_URL_DIRECT" -v app_role=YOUR_APP_ROLE -f scripts/grant_application_role.sql`
+to grant privileges. Supply a plain PostgreSQL URL to psql. The root Compose
+bootstrap administrator is not the application's runtime role.
+
+Use `get_session` as a FastAPI dependency, or `transaction` with an async session
+factory. Identity comes from trusted authentication on request.state; absent
+identity is a guest. The helper owns commit/rollback; do not commit early within it.
+Do not put identity in connection-wide settings.
+
+For integration verification, create a fresh separate database named
+`dormiostay_t03_test_<unique_suffix>` and set `TEST_DATABASE_URL` to it, using
+a test administrator allowed to create temporary test roles. Run
+`uv run --no-sync pytest`. Tests refuse other database names and nonempty
+databases, migrate up, run assertions and downgrade at teardown. They do not
+fall back to DATABASE_URL or use the development database.
+Set `TEST_DATABASE_NAME` to the exact disposable name and
+`TEST_APP_DATABASE_URL` to the same database using the restricted
+`dormiostay_app` login. The fixture checks the connected database name and
+rejects URL query parameters that can override host, user or database.
+Without TEST_DATABASE_URL, integration tests are reported as skipped.
+Never run `alembic downgrade base` on development/production to verify migrations.
+
+Category names/active flags, integer profile budget bounds, and text-array
+preferred areas are the minimal representations of fields left unspecified in
+the architecture. Future property and authentication tables are not created.
+
+Local API credentials are in the ignored `apps/api/.env` (mode 0600):
+DATABASE_URL uses dormiostay_app; DATABASE_URL_DIRECT uses the bootstrap
+administrator. Startup/readiness and request sessions reject elevated runtime
+roles, memberships, ownership and public-schema CREATE permission.
+The development schema has not been migrated; application-role table privileges
+were tested in the disposable database. Logging deliberately retains only
+sanitized event codes, level, timestamp and validated request IDs; Sentry
+discards exception payloads, request data, breadcrumbs and arbitrary context.
+
 From the repository root, run the same checks as the web CI job:
 
 ```sh

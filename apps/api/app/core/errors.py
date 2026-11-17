@@ -77,10 +77,10 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
     request_id = getattr(request.state, "request_id", "unknown")
-    logger.exception("Unhandled application error", extra={"request_id": request_id})
+    logger.error("Unhandled application error", extra={"request_id": request_id})
     with sentry_sdk.new_scope() as scope:
         scope.set_tag("request_id", request_id)
-        sentry_sdk.capture_exception(exc)
+        sentry_sdk.capture_message("Application error", level="error")
     return JSONResponse(
         _body(request, "INTERNAL_SERVER_ERROR", "Something went wrong on our side."),
         status_code=500,

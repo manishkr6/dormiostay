@@ -2,11 +2,11 @@
 
 import asyncio
 
-import asyncpg  # type: ignore[import-untyped]
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.core.config import Settings
+from app.db.session import check_runtime_database
 
 router = APIRouter()
 
@@ -16,11 +16,10 @@ def _asyncpg_url(database_url: str) -> str:
 
 
 async def check_database(settings: Settings) -> None:
-    connection = await asyncio.wait_for(
-        asyncpg.connect(_asyncpg_url(settings.database_url)),
+    await asyncio.wait_for(
+        check_runtime_database(settings.database_url),
         timeout=settings.database_connect_timeout_seconds,
     )
-    await connection.close()
 
 
 @router.get("/healthz", tags=["health"])
