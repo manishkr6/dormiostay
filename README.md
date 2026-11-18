@@ -3,8 +3,8 @@
 PG, hostel, and student accommodation marketplace for ICFAI University Sikkim and Gangtok.
 
 This is the DormioStay foundation. It contains the T-02 FastAPI runtime skeleton
-and a minimal React page so both development servers and test runners can be
-verified. Product features are built ticket by ticket, with review between tickets.
+and the T-04 React frontend foundation with a component showcase, shared layouts,
+and a same-origin API client. Product features are built ticket by ticket, with review between tickets.
 
 ## Requirements
 
@@ -59,8 +59,10 @@ Terminal 2, from the repository root:
 npm run dev:web
 ```
 
-Visit <http://127.0.0.1:5173>. The page displays “DormioStay”. Stop either server
-with Ctrl+C. T-01 does not require database, Redis, email, or AI credentials.
+Visit <http://127.0.0.1:5173/showcase> for the component library. Shared layout
+previews are at `/auth`, `/tenant`, `/owner`, and `/admin`; they contain no protected
+data or working product features. Stop either server with Ctrl+C. The showcase
+works without database, Redis, email, or AI credentials.
 
 ## Environment configuration
 
@@ -214,7 +216,54 @@ Follow the Global Context block in
 Add architecture folders as their tickets need them: backend routes in `app/api/v1`,
 business logic in `app/services`, SQL in `app/repositories`; frontend routes and
 providers in `src/app`, layouts in `src/layouts`, shared UI in `src/components/ui`.
-The current page is an unstyled toolchain placeholder. Design tokens, fonts,
-UI components, routing, and the same-origin API proxy belong to T-04. Backend
-configuration and health checks belong to T-02, models and migrations to T-03,
-and Render deployment to T-05.
+T-04 supplies design tokens, fonts, the base UI kit, nested layout previews,
+page metadata, and the same-origin API client. Backend configuration and health
+checks belong to T-02, models and migrations to T-03, and Render deployment to T-05.
+
+## T-04 frontend foundation
+
+`src/styles/tokens.css` is the colour, spacing, radius and shadow source of truth.
+Tailwind v4 loads `tailwind.config.ts` explicitly through `@config`, mapping the
+approved DormioStay tokens. Shared components live in `src/components/ui`;
+Radix primitives handle dialogs, tabs, switches and toast accessibility. Native
+labelled controls handle basic form input. Playfair Display and Inter load through
+Google Fonts with `display=swap` and local fallback stacks.
+
+The showcase covers all six button variants and all six states, form controls,
+badges, cards, modal/drawer/bottom sheet, tabs, toasts, skeleton/empty/error states,
+and the wake-up banner. The small admin button keeps a 44px hit target to satisfy
+the ticket's accessibility criterion. Dark mode and product screens are deferred.
+
+Use `apiClient<ResponseType>('/resource', options)` from `src/lib/api-client.ts`.
+It prefixes `/api/v1`, includes session cookies, rejects external/traversal paths,
+and parses standard errors into `ApiError` (`status`, `code`, `fields`, `requestId`,
+`retryAfter`). Writes fetch `{token: string}` from `/api/v1/auth/csrf` and send
+`X-CSRF-Token`; T-07 must supply that endpoint. Tokens are never stored in browser
+storage or cached across sessions. Requests timeout after 65 seconds by default,
+accept cancellation, and trigger the global wake-up banner after four seconds.
+There are no automatic write retries. TanStack Query also defaults to no retries.
+
+Vite proxies `/api` to `http://localhost:8000` without stripping `/api/v1` or
+changing the browser's Origin header. `PageHead` owns title, description, Open
+Graph tags and escaped JSON-LD with cleanup on route changes. Previews are noindex.
+Client-side metadata is not a substitute for the later server share-preview ticket.
+
+### Render rewrite handoff (no deployment in T-04)
+
+`apps/web/config/render-routes.ts` provides ordered, tested Render route rules for
+either staging or production. Generate the dashboard/Blueprint route entries
+with the actual public HTTPS backend origin for that environment:
+
+```sh
+cd apps/web
+node --experimental-strip-types scripts/render-routes.ts https://YOUR-API.onrender.com
+```
+
+The rules are `/api/*` → `https://YOUR-API.onrender.com/api/*` first, then `/*` →
+`/index.html`, both **Rewrite**, not Redirect. Preserve the full API path.
+Apply the generated entries in that Static Site's Redirects/Rewrites settings or
+its Blueprint `routes` in T-05. The actual staging/production service URLs are not
+in this repository, so this ticket does not invent destinations or configure a
+hosted service. Render does not consume a Netlify `_redirects` file.
+See [Render's rewrite documentation](https://render.com/docs/redirects-rewrites).
+No `render.yaml`, hosted services, cron jobs, secrets or deployment were added.
