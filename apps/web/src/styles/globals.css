@@ -583,6 +583,13 @@
     width: 36px;
     height: 36px;
     border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+  .brand-icon-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
   }
   .desktop-nav,
   .header-note {
@@ -927,9 +934,65 @@
   .footer-inner p {
     margin-top: var(--space-2);
   }
+  .footer-brand-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .footer-logo-icon {
+    border-radius: var(--radius-sm);
+    display: block;
+  }
   .footer-brand {
     font-size: 20px;
     font-weight: 600;
+  }
+  .logo-showcase-card {
+    grid-column: 1 / -1;
+    margin-top: var(--space-4);
+  }
+  .logo-preview-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-6);
+    margin-top: var(--space-4);
+  }
+  .logo-preview-item {
+    flex: 1 1 240px;
+    padding: var(--space-6);
+    border-radius: var(--radius-md);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: var(--space-3);
+    border: 1px solid var(--color-border);
+  }
+  .logo-preview-item.light-bg {
+    background: var(--color-surface);
+  }
+  .logo-preview-item.dark-bg {
+    background: var(--color-primary-900);
+    color: var(--color-surface);
+  }
+  .logo-preview-item.icon-bg {
+    background: var(--color-primary-50);
+  }
+  .logo-preview-label {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .logo-preview-img {
+    max-width: 100%;
+    height: auto;
+    object-fit: contain;
+  }
+  .logo-preview-icon {
+    border-radius: 50%;
+    box-shadow: var(--shadow-card);
   }
   .footer-inner a {
     display: inline-flex;

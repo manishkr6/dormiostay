@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation } from 'react-router';
-import { House, Menu, ArrowUpRight } from 'lucide-react';
+import { Menu, ArrowUpRight } from 'lucide-react';
 import { Drawer } from '../components/ui/drawer';
 import { Button } from '../components/ui/button';
 
@@ -49,7 +49,7 @@ export function LayoutFrame({ kind }: { kind: 'Public' | 'Auth' | 'Tenant' | 'Ow
         <div className="header-inner">
           <Link className="brand" to="/" aria-label="DormioStay home">
             <span className="brand-icon">
-              <House aria-hidden="true" />
+              <img src="/logo-icon.png" alt="" width={36} height={36} className="brand-icon-img" />
             </span>
             DormioStay
             <span className="brand-dot" aria-hidden="true">
@@ -109,7 +109,16 @@ export function LayoutFrame({ kind }: { kind: 'Public' | 'Auth' | 'Tenant' | 'Ow
       <footer className="site-footer">
         <div className="footer-inner">
           <div>
-            <span className="footer-brand">DormioStay</span>
+            <div className="footer-brand-row">
+              <img
+                src="/logo-icon.png"
+                alt=""
+                width={28}
+                height={28}
+                className="footer-logo-icon"
+              />
+              <span className="footer-brand">DormioStay</span>
+            </div>
             <p>Find your stay. Live with confidence.</p>
           </div>
           <a href="mailto:dormiostay@gmail.com">dormiostay@gmail.com</a>

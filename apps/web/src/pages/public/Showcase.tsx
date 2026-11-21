@@ -2,7 +2,6 @@ import { useState } from 'react';
 import {
   ArrowUpRight,
   Heart,
-  House,
   Check,
   ArrowRight,
   Layers,
@@ -160,6 +159,44 @@ export function Showcase() {
             </div>
             <p className="field-helper">
               Labels carry meaning alongside colour. All content here is a component example.
+            </p>
+          </Card>
+          <Card className="logo-showcase-card">
+            <p className="eyebrow">BRAND LOGOS &amp; ICONS</p>
+            <h3>Visual identity across web &amp; mobile</h3>
+            <div className="logo-preview-row">
+              <div className="logo-preview-item light-bg">
+                <span className="logo-preview-label">Website Logo (Transparent)</span>
+                <img
+                  src="/logo.png"
+                  alt="DormioStay light transparent logo"
+                  className="logo-preview-img"
+                  width={180}
+                />
+              </div>
+              <div className="logo-preview-item dark-bg">
+                <span className="logo-preview-label">Website Logo (Dark)</span>
+                <img
+                  src="/logo-dark.png"
+                  alt="DormioStay dark logo"
+                  className="logo-preview-img"
+                  width={180}
+                />
+              </div>
+              <div className="logo-preview-item icon-bg">
+                <span className="logo-preview-label">Mobile App Icon &amp; Mark</span>
+                <img
+                  src="/logo-icon.png"
+                  alt="DormioStay circular mark"
+                  className="logo-preview-icon"
+                  width={120}
+                  height={120}
+                />
+              </div>
+            </div>
+            <p className="field-helper">
+              Standard DormioStay brand marks optimized for responsive headers, dark modes, and
+              mobile app icons.
             </p>
           </Card>
         </div>
@@ -447,7 +484,7 @@ export function Showcase() {
       </section>
       <div className="showcase-end">
         <span className="brand-icon">
-          <House aria-hidden="true" />
+          <img src="/logo-icon.png" alt="" width={36} height={36} className="brand-icon-img" />
         </span>
         <p>
           Built to feel familiar.
