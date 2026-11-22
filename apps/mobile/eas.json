@@ -4,9 +4,25 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
-      "env": { "APP_VARIANT": "development" }
+      "env": {
+        "APP_VARIANT": "development",
+        "EXPO_PUBLIC_APP_VARIANT": "development"
+      }
     },
-    "preview": { "distribution": "internal", "env": { "APP_VARIANT": "preview" } },
-    "production": { "env": { "APP_VARIANT": "production" } }
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "APP_VARIANT": "preview",
+        "EXPO_PUBLIC_APP_VARIANT": "preview",
+        "EXPO_PUBLIC_API_BASE_URL": "https://staging-api.dormiostay.com/api/v1"
+      }
+    },
+    "production": {
+      "env": {
+        "APP_VARIANT": "production",
+        "EXPO_PUBLIC_APP_VARIANT": "production",
+        "EXPO_PUBLIC_API_BASE_URL": "https://api.dormiostay.com/api/v1"
+      }
+    }
   }
 }

@@ -13,9 +13,23 @@ def validate_test_url(value: str, approved: str | None) -> URL:
     url = async_url(value)
     if not approved or not re.fullmatch(r"dormiostay_t03_test_[a-z0-9_]+", approved):
         raise ValueError("An explicitly approved disposable database name is required")
-    if url.database != approved or url.host not in {"127.0.0.1", "localhost", "::1"}:
+    if url.database != approved:
         raise ValueError("Test target must be the approved local disposable database")
-    return url
+
+    raw_host = url.host or ""
+    # Reject multi-host, paths, Unix domain sockets, or non-standard characters
+    if not raw_host or any(c in raw_host for c in [",", "/", "\\", " ", "@"]):
+        raise ValueError("Test target must be the approved local disposable database")
+
+    normalized_host = raw_host.strip("[]").lower()
+    if normalized_host in {"localhost", "127.0.0.1"}:
+        canonical_host = "127.0.0.1"
+    elif normalized_host == "::1":
+        canonical_host = "::1"
+    else:
+        raise ValueError("Test target must be the approved local disposable database")
+
+    return url.set(host=canonical_host)
 
 
 async def verify_test_connection(connection: AsyncConnection, approved: str) -> None:

@@ -78,4 +78,29 @@ for (const variant of ['development', 'preview', 'production']) {
   checkVariant(variant);
 }
 
+// Verify eas.json build profiles and environment isolation
+const easPath = path.resolve(projectRoot, 'eas.json');
+assert(fs.existsSync(easPath), `eas.json not found: ${easPath}`);
+const easConfig = JSON.parse(fs.readFileSync(easPath, 'utf8'));
+assert(easConfig.build?.development, 'EAS development profile missing');
+assert(easConfig.build?.preview, 'EAS preview profile missing');
+assert(easConfig.build?.production, 'EAS production profile missing');
+
+// Validate preview and production API base URLs in eas.json
+const previewApi = easConfig.build.preview.env?.EXPO_PUBLIC_API_BASE_URL;
+const prodApi = easConfig.build.production.env?.EXPO_PUBLIC_API_BASE_URL;
+assert(
+  previewApi && previewApi.startsWith('https://') && previewApi.endsWith('/api/v1'),
+  `EAS preview API base must be an HTTPS URL ending in /api/v1 (got ${previewApi})`,
+);
+assert(
+  prodApi && prodApi.startsWith('https://') && prodApi.endsWith('/api/v1'),
+  `EAS production API base must be an HTTPS URL ending in /api/v1 (got ${prodApi})`,
+);
+assert(
+  previewApi !== prodApi,
+  'EAS preview and production must use distinct isolated API environments',
+);
+
+console.log('✓ EAS build profiles and environment isolation verified.');
 console.log('All Expo configuration checks passed.');

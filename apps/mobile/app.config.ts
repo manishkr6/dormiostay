@@ -43,6 +43,9 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       bundleIdentifier: `app.dormiostay.mobile${suffix}`,
       supportsTablet: true,
       config: { usesNonExemptEncryption: false },
+      // NOTE: iOS Universal Links (associatedDomains) are deferred to T-10/T-14M
+      // pending production domain ownership, hosted apple-app-site-association file,
+      // and Apple Developer Team ID association.
     },
     android: {
       package: `app.dormiostay.mobile${suffix}`,
@@ -65,6 +68,9 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         backgroundColor: tokens.colors.indigo,
       },
       softwareKeyboardLayoutMode: 'resize',
+      // NOTE: Android App Links (intentFilters with autoVerify) are deferred to T-10/T-14M
+      // pending production domain ownership, hosted /.well-known/assetlinks.json manifest,
+      // and EAS production keystore SHA-256 fingerprint generation.
     },
     plugins: [
       'expo-router',

@@ -1,0 +1,12 @@
+# =============================================================================
+# DormioStay FastAPI Backend — Pinned Production Dependencies (Python 3.12)
+# Generated from apps/api/pyproject.toml for Render deployment compatibility
+# =============================================================================
+sqlalchemy[asyncio]==2.0.44
+alembic==1.17.2
+fastapi==0.141.1
+asyncpg==0.30.0
+pydantic==2.13.5
+pydantic-settings==2.10.1
+sentry-sdk[fastapi]==2.46.0
+uvicorn==0.52.4

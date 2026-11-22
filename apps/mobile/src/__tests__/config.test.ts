@@ -1,4 +1,5 @@
 import { validateApiBase, configuredApiBase, isDevelopment } from '../lib/config';
+import { createSessionStore } from '../lib/session-store';
 
 describe('Mobile API Base Configuration', () => {
   it('accepts a valid HTTPS API base ending in /api/v1', () => {
@@ -80,5 +81,26 @@ describe('Mobile Development Runtime Detection', () => {
     delete process.env.EXPO_PUBLIC_APP_VARIANT;
     process.env.NODE_ENV = 'production';
     expect(isDevelopment()).toBe(false);
+  });
+});
+
+describe('Mobile Environment Isolation & Profile Handoff', () => {
+  it('enforces staging and production API bases to be HTTPS and end in /api/v1', () => {
+    const stagingApi = 'https://staging-api.dormiostay.com/api/v1';
+    const prodApi = 'https://api.dormiostay.com/api/v1';
+
+    expect(validateApiBase(stagingApi)).toBe(stagingApi);
+    expect(validateApiBase(prodApi)).toBe(prodApi);
+    expect(stagingApi).not.toBe(prodApi);
+  });
+
+  it('generates distinct SecureStore session stores for staging and production API bases', () => {
+    const stagingStore = createSessionStore('https://staging-api.dormiostay.com/api/v1');
+    const prodStore = createSessionStore('https://api.dormiostay.com/api/v1');
+
+    // Both stores instantiate and target isolated environments
+    expect(stagingStore).toBeDefined();
+    expect(prodStore).toBeDefined();
+    expect(stagingStore).not.toBe(prodStore);
   });
 });

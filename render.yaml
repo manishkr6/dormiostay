@@ -1,0 +1,93 @@
+# =============================================================================
+# DormioStay — Render Blueprint Infrastructure Specification (render.yaml)
+# Version: 1.0.0 | Ticket: T-05 (Render Deployment & Environments)
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. DormioStay Web Frontend — Render Static Site
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: dormiostay-web
+    runtime: static
+    branch: main
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./apps/web/dist
+    routes:
+      # API Reverse Proxy / Rewrite (T-05: PENDING VERIFIED DESTINATION)
+      # SECURITY NOTICE: Disabled until the staging API service is provisioned
+      # after user approval, its actual Render-assigned URL is obtained, and ownership
+      # is verified against the provisioned service. DO NOT activate with unverified placeholders.
+      # Once verified, uncomment and set destination to the verified API origin:
+      # - type: rewrite
+      #   source: /api/*
+      #   destination: https://<VERIFIED_STAGING_API_ORIGIN>/api/*
+
+      # Single Page Application (SPA) Client-Side Routing Fallback (React Router)
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+      - path: /*
+        name: Permissions-Policy
+        value: camera=(), microphone=(), geolocation=(), payment=()
+
+  # ---------------------------------------------------------------------------
+  # 2. DormioStay API — FastAPI Backend Web Service
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: dormiostay-api
+    plan: free
+    runtime: python
+    branch: main
+    rootDir: apps/api
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.9
+      - key: APP_ENV
+        value: staging
+      # Sensitive secrets are marked with sync: false. Render prompts for these
+      # during Blueprint setup in the dashboard and never stores them in Git.
+      - key: DATABASE_URL
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
+      - key: REQUEST_ID_HEADER
+        value: X-Request-ID
+      - key: DATABASE_CONNECT_TIMEOUT_SECONDS
+        value: '5.0'
+
+  # ---------------------------------------------------------------------------
+  # 3. DormioStay Email Worker — Scheduled Background Cron Job (T-09 Dependency)
+  # ---------------------------------------------------------------------------
+  # NOTE: Kept unprovisioned/commented out until T-09 delivers scripts/worker.py.
+  # Scheduling a nonexistent worker would fail and trigger unintended charges.
+  # Planned schedule: "* * * * *" (runs every minute).
+  # ---------------------------------------------------------------------------
+  # - type: cron
+  #   name: dormiostay-worker
+  #   runtime: python
+  #   rootDir: apps/api
+  #   schedule: "* * * * *"
+  #   buildCommand: pip install -r requirements.txt
+  #   startCommand: python -m scripts.worker
+  #   envVars:
+  #     - fromService:
+  #         type: web
+  #         name: dormiostay-api
+  #         property: envVars

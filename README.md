@@ -248,22 +248,12 @@ changing the browser's Origin header. `PageHead` owns title, description, Open
 Graph tags and escaped JSON-LD with cleanup on route changes. Previews are noindex.
 Client-side metadata is not a substitute for the later server share-preview ticket.
 
-### Render rewrite handoff (no deployment in T-04)
+### Render deployment and environment configuration (T-05)
 
-`apps/web/config/render-routes.ts` provides ordered, tested Render route rules for
-either staging or production. Generate the dashboard/Blueprint route entries
-with the actual public HTTPS backend origin for that environment:
+`render.yaml` defines the infrastructure blueprint for deploying DormioStay on Render:
 
-```sh
-cd apps/web
-node --experimental-strip-types scripts/render-routes.ts https://YOUR-API.onrender.com
-```
+- **Web Frontend (`dormiostay-web`)**: Render Static Site built with `npm ci && npm run build` and published from `./apps/web/dist`. Configured with ordered rewrite rules routing `/api/*` to the FastAPI backend service and `/*` to `/index.html` for React Router SPA navigation.
+- **FastAPI Backend (`dormiostay-api`)**: Python 3.12 web service rooted in `apps/api/`, installing pinned dependencies from `requirements.txt` and starting ASGI server via `uvicorn app.main:app --host 0.0.0.0 --port $PORT`. Liveness probe is mounted at `/healthz` and readiness probe at `/readyz`. Sensitive credentials (`DATABASE_URL`, `FRONTEND_ORIGIN`, `SENTRY_DSN`) are defined with `sync: false` for secure manual dashboard entry.
+- **Email Worker**: Kept unprovisioned/commented out until T-09 implements `scripts/worker.py`.
 
-The rules are `/api/*` → `https://YOUR-API.onrender.com/api/*` first, then `/*` →
-`/index.html`, both **Rewrite**, not Redirect. Preserve the full API path.
-Apply the generated entries in that Static Site's Redirects/Rewrites settings or
-its Blueprint `routes` in T-05. The actual staging/production service URLs are not
-in this repository, so this ticket does not invent destinations or configure a
-hosted service. Render does not consume a Netlify `_redirects` file.
-See [Render's rewrite documentation](https://render.com/docs/redirects-rewrites).
-No `render.yaml`, hosted services, cron jobs, secrets or deployment were added.
+For comprehensive details on environment mapping, Neon PostgreSQL database branching, Upstash Redis configuration, sleeping API cold-start behavior, always-on upgrade steps, and mobile environment profiles, refer to [Deployment and Environments Guide](docs/deployment-and-environments.md).

@@ -34,19 +34,34 @@ describe('Deep Linking and Safe Path Redirection', () => {
     expect(safeIncomingPath('dormiostay-preview://tenant')).toBe('/tenant');
   });
 
+  it('allows allowlisted HTTPS deep links matching valid routes', () => {
+    expect(safeIncomingPath('https://dormiostay.com/help')).toBe('/help');
+    expect(safeIncomingPath('https://dormiostay.com/property-preview')).toBe('/property-preview');
+    expect(safeIncomingPath('https://preview.dormiostay.com/tenant')).toBe('/tenant');
+    expect(safeIncomingPath('https://staging.dormiostay.com/auth/login')).toBe('/auth/login');
+  });
+
   it('safely falls back to root / for unknown or unapproved routes', () => {
     expect(safeIncomingPath('/admin')).toBe('/');
     expect(safeIncomingPath('/admin/moderation')).toBe('/');
     expect(safeIncomingPath('/unknown-path')).toBe('/');
     expect(safeIncomingPath('//evil.com')).toBe('/');
+    expect(safeIncomingPath('https://dormiostay.com/admin')).toBe('/');
+    expect(safeIncomingPath('https://dormiostay.com/admin/moderation')).toBe('/');
+    expect(safeIncomingPath('https://dormiostay.com/unknown-route')).toBe('/');
   });
 
-  it('safely falls back to root / for malicious schemes, credentials, or query injections', () => {
+  it('safely falls back to root / for unauthorized hosts, schemes, credentials, or query injections', () => {
     expect(safeIncomingPath('https://evil.com/phishing')).toBe('/');
+    expect(safeIncomingPath('https://evil.com/help')).toBe('/');
+    expect(safeIncomingPath('https://not-dormiostay.com/help')).toBe('/');
     expect(safeIncomingPath('javascript:alert(1)')).toBe('/');
     expect(safeIncomingPath('dormiostay://user:pass@tenant')).toBe('/');
     expect(safeIncomingPath('dormiostay://tenant?arbitrary=1')).toBe('/');
     expect(safeIncomingPath('dormiostay://tenant#hash')).toBe('/');
+    expect(safeIncomingPath('https://user:pass@dormiostay.com/help')).toBe('/');
+    expect(safeIncomingPath('https://dormiostay.com/help?token=secret')).toBe('/');
+    expect(safeIncomingPath('https://dormiostay.com/help#section')).toBe('/');
   });
 });
 
@@ -55,6 +70,7 @@ describe('Component Showcase Route Guarding', () => {
     expect(isAllowedRoute('/showcase', true)).toBe(true);
     expect(safeIncomingPath('/showcase', true)).toBe('/showcase');
     expect(safeIncomingPath('dormiostay-development://showcase', true)).toBe('/showcase');
+    expect(safeIncomingPath('https://dormiostay.com/showcase', true)).toBe('/showcase');
   });
 
   it('rejects /showcase in production and preview modes', () => {
@@ -62,5 +78,6 @@ describe('Component Showcase Route Guarding', () => {
     expect(safeIncomingPath('/showcase', false)).toBe('/');
     expect(safeIncomingPath('dormiostay://showcase', false)).toBe('/');
     expect(safeIncomingPath('dormiostay-development://showcase', false)).toBe('/');
+    expect(safeIncomingPath('https://dormiostay.com/showcase', false)).toBe('/');
   });
 });

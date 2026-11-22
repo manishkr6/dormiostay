@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ToastProvider } from '../components/ui/toast';
 import { WakingBanner } from '../components/ui/waking-banner';
+import { StartupProbe } from '../components/ui/startup-probe';
 export function Providers({ children }: { children: ReactNode }) {
   const [client] = useState(
     () =>
@@ -15,6 +16,7 @@ export function Providers({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={client}>
       <ToastProvider>
+        <StartupProbe />
         <WakingBanner />
         {children}
       </ToastProvider>
