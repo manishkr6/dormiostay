@@ -80,6 +80,7 @@ from scripts.provision_neon_staging_role import (
     cli_entrypoint,
     map_db_error,
     map_http_error,
+    verify_scram_sha256,
 )
 
 
@@ -176,6 +177,11 @@ class MockDbConn:
         throw_on_create_role: bool = False,
         throw_on_auth_query: bool = False,
         client_ssl_active: bool | None = None,
+        scram_verifier: str | None = None,
+        stall_structural_after_login: bool = False,
+        stall_on_alter_login: bool = False,
+        throw_on_alter_login: BaseException | None = None,
+        throw_on_close_exc: BaseException | None = None,
     ) -> None:
         self.current_user = current_user
         self.session_user = session_user
@@ -186,6 +192,7 @@ class MockDbConn:
             self.client_ssl_active = bool(ssl_active) if ssl_active is not None else True
         else:
             self.client_ssl_active = client_ssl_active
+        self.scram_verifier = scram_verifier
         self.role_exists = role_exists
         self.pub_schema_create = pub_schema_create
         self.pub_db_create = pub_db_create
@@ -218,6 +225,11 @@ class MockDbConn:
         self.throw_on_create_role = throw_on_create_role
         self.throw_on_auth_query = throw_on_auth_query
         self.throw_on_close = False
+        self.stall_structural_after_login = stall_structural_after_login
+        self.stall_on_alter_login = stall_on_alter_login
+        self.throw_on_alter_login = throw_on_alter_login
+        self.throw_on_close_exc = throw_on_close_exc
+        self.stall_on_structural_check = False
         self.executed_statements: list[str] = []
         self.is_closed: bool = False
         self._protocol = MagicMock(is_ssl=self.client_ssl_active)
@@ -239,6 +251,10 @@ class MockDbConn:
             return (self.current_user, self.session_user, self.current_database, self.ssl_active)
         if "SELECT count(*) FROM pg_roles WHERE rolname" in q:
             return (1 if self.role_exists else 0,)
+        if "SELECT rolcanlogin FROM pg_roles WHERE rolname" in q:
+            if not self.role_exists:
+                return None
+            return (self.role_flags.get("rolcanlogin", False),)
         if "has_schema_privilege('public', 'public', 'CREATE')" in q:
             return {
                 "pub_schema_create": self.pub_schema_create,
@@ -264,12 +280,18 @@ class MockDbConn:
             if self.throw_on_auth_query:
                 raise RuntimeError("Simulated query failure during auth check")
             return (self.current_user, self.session_user)
+        if "SELECT rolpassword FROM pg_authid" in q:
+            if self.scram_verifier is not None:
+                return (self.scram_verifier,)
+            return None
         return None
 
     async def fetch(self, query: str, *args: Any) -> list[Any]:
         if "SELECT * FROM pg_roles WHERE rolname" in query:
             if not self.role_exists:
                 return []
+            if self.stall_on_structural_check:
+                await asyncio.Future()
             return [self.role_flags]
         return []
 
@@ -282,12 +304,21 @@ class MockDbConn:
         if "CREATE ROLE" in query:
             self.role_exists = True
         if "ALTER ROLE" in query and "LOGIN;" in query:
+            if self.throw_on_alter_login is not None:
+                raise self.throw_on_alter_login
+            if self.stall_on_alter_login:
+                await asyncio.Future()
             self.role_flags["rolcanlogin"] = True
+            if self.stall_structural_after_login:
+                self.stall_on_structural_check = True
         if "ALTER ROLE" in query and "NOLOGIN;" in query:
             self.role_flags["rolcanlogin"] = False
+            self.stall_on_structural_check = False
 
     async def close(self) -> None:
         self.is_closed = True
+        if self.throw_on_close_exc is not None:
+            raise self.throw_on_close_exc
         if self.throw_on_close:
             raise RuntimeError("Connection dropped during close")
 
@@ -301,11 +332,13 @@ class MockDatabaseConnector:
         fresh_admin_conn: MockDbConn | None = None,
         app_conn: MockDbConn | None = None,
         raise_on_connect: Exception | None = None,
+        stall_on_app_connect: bool = False,
     ) -> None:
         self.admin_conn = admin_conn or MockDbConn(role_exists=False)
         self.fresh_admin_conn = fresh_admin_conn
         self.app_conn = app_conn
         self.raise_on_connect = raise_on_connect
+        self.stall_on_app_connect = stall_on_app_connect
         self.connect_calls: list[dict[str, Any]] = []
 
     async def connect(
@@ -338,9 +371,16 @@ class MockDatabaseConnector:
             return self.admin_conn
 
         if user == APP_ROLE:
+            if self.stall_on_app_connect:
+                await asyncio.Future()
             if self.app_conn is not None:
                 return self.app_conn
-            return MockDbConn(current_user=APP_ROLE, session_user=APP_ROLE, role_exists=True)
+            return MockDbConn(
+                current_user=APP_ROLE,
+                session_user=APP_ROLE,
+                role_exists=True,
+                role_flags={"rolcanlogin": True},
+            )
 
         return MockDbConn()
 
@@ -6623,3 +6663,908 @@ def test_astra_sigint_blocker_run_with_bounded_sigint_handling_resource_hygiene(
 
     result = _run_with_bounded_sigint_handling(sample_coro())
     assert result == "success"
+
+
+def make_mock_scram_verifier(
+    password: str, iterations: int = 4096, salt: bytes = b"mock_scram_salt_1234"
+) -> str:
+    """Generate a valid RFC 5802 SCRAM-SHA-256 verifier for test assertions."""
+    import base64
+    import hashlib
+    import hmac
+
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    ck = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+    sk = hashlib.sha256(ck).digest()
+    servk = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+    salt_b64 = base64.b64encode(salt).decode("ascii")
+    sk_b64 = base64.b64encode(sk).decode("ascii")
+    servk_b64 = base64.b64encode(servk).decode("ascii")
+    return f"SCRAM-SHA-256${iterations}:{salt_b64}${sk_b64}:{servk_b64}"
+
+
+def test_scram_verifier_rfc5802_verification() -> None:
+    """Test cryptographic SCRAM-SHA-256 verifier algorithm and edge cases."""
+    pwd = "staging-secret-password-xyz"
+    verifier = make_mock_scram_verifier(pwd)
+
+    # Valid matching password
+    assert verify_scram_sha256(pwd, verifier) is True
+
+    # Password mismatch
+    assert verify_scram_sha256("wrong-password", verifier) is False
+
+    # Edge cases and malformed inputs
+    assert verify_scram_sha256("", verifier) is False
+    assert verify_scram_sha256(pwd, "") is False
+    assert verify_scram_sha256(pwd, "md5123456789abcdef") is False
+    assert verify_scram_sha256(pwd, "SCRAM-SHA-256$malformed") is False
+    assert verify_scram_sha256(pwd, "SCRAM-SHA-256$-100:salt$stored:server") is False
+    assert verify_scram_sha256(pwd, "SCRAM-SHA-256$4096:bad_base64!$stored:server") is False
+    assert verify_scram_sha256(pwd, "SCRAM-SHA-256$4096:c2FsdA==$tooshort:tooshort") is False
+
+
+def test_cli_promote_requires_confirm_branch(
+    checkpoint_file: str, mock_secret_store: SecretStore
+) -> None:
+    """CLI --promote-role fails immediately if --confirm-branch is omitted."""
+    api = MockNeonApi()
+    code = cli_entrypoint(
+        ["--promote-role", "--checkpoint-file", checkpoint_file],
+        api_client=api,
+        secret_store=mock_secret_store,
+        admin_password="test-password",
+    )
+    assert code == 1
+
+
+def test_cli_promote_rejects_production_branch(
+    checkpoint_file: str, mock_secret_store: SecretStore
+) -> None:
+    """CLI --promote-role strictly rejects production branch ID."""
+    api = MockNeonApi()
+    code = cli_entrypoint(
+        [
+            "--promote-role",
+            "--confirm-branch",
+            PRODUCTION_BRANCH_ID,
+            "--checkpoint-file",
+            checkpoint_file,
+        ],
+        api_client=api,
+        secret_store=mock_secret_store,
+        admin_password="test-password",
+    )
+    assert code == 1
+
+
+def test_cli_promote_without_admin_password_exits_1(
+    checkpoint_file: str, mock_secret_store: SecretStore
+) -> None:
+    """CLI --promote-role fails if administrator password is not supplied."""
+    api = MockNeonApi()
+    code = cli_entrypoint(
+        [
+            "--promote-role",
+            "--confirm-branch",
+            STAGING_BRANCH_ID,
+            "--checkpoint-file",
+            checkpoint_file,
+        ],
+        api_client=api,
+        secret_store=mock_secret_store,
+        admin_password="",
+    )
+    assert code == 1
+
+
+def test_cli_verify_only_without_promote_fails(
+    checkpoint_file: str, mock_secret_store: SecretStore
+) -> None:
+    """CLI --verify-only is rejected when used without --promote-role."""
+    api = MockNeonApi()
+    code = cli_entrypoint(
+        ["--verify-only", "--checkpoint-file", checkpoint_file],
+        api_client=api,
+        secret_store=mock_secret_store,
+        admin_password="test-password",
+    )
+    assert code == 1
+
+
+def test_cli_promote_verify_only_succeeds(
+    checkpoint_file: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CLI --promote-role --verify-only verifies all pre-conditions without ALTER ROLE LOGIN."""
+    test_pwd = "keychain-app-password-1234"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    scram_ver = make_mock_scram_verifier(test_pwd)
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=scram_ver,
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+
+    code = cli_entrypoint(
+        [
+            "--promote-role",
+            "--confirm-branch",
+            STAGING_BRANCH_ID,
+            "--verify-only",
+            "--checkpoint-file",
+            checkpoint_file,
+        ],
+        api_client=api,
+        secret_store=mock_store,
+        connector=connector,
+        admin_password="valid-admin-password",
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "[+] Promotion pre-conditions VERIFIED for 'dormiostay_app'" in captured.out
+    assert "role remains NOLOGIN" in captured.out
+    assert not any("ALTER ROLE" in q and "LOGIN;" in q for q in admin_conn.executed_statements)
+
+
+def test_promote_role_success_lifecycle(checkpoint_file: str) -> None:
+    """Full lifecycle test for --promote-role recovery with matching Keychain and SCRAM."""
+    test_pwd = "staging-promoted-password-12345"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    scram_ver = make_mock_scram_verifier(test_pwd)
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=scram_ver,
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert provisioner.state == ProvisioningState.COMPLETED
+    assert any("ALTER ROLE" in q and "LOGIN;" in q for q in admin_conn.executed_statements)
+    assert admin_conn.role_flags["rolcanlogin"] is True
+
+    # Assert checkpoints
+    latest = ckpt_mgr.get_latest_checkpoint()
+    assert latest is not None
+    assert latest.state == ProvisioningState.COMPLETED
+
+    content = json.loads(Path(checkpoint_file).read_text(encoding="utf-8"))
+    states = [item["state"] for item in content]
+    assert ProvisioningState.METADATA_VERIFIED.value in states
+    assert ProvisioningState.PRIVILEGES_VERIFIED.value in states
+    assert ProvisioningState.LOGIN_ENABLED.value in states
+    assert ProvisioningState.COMPLETED.value in states
+
+
+def test_promote_role_fails_when_role_does_not_exist(checkpoint_file: str) -> None:
+    """Promotion recovery fails if role does not exist in pg_roles."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(role_exists=False)
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(PrivilegeVerificationError, match="does not exist in database"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert not any("ALTER ROLE" in q and "LOGIN;" in q for q in admin_conn.executed_statements)
+
+
+def test_promote_role_fails_when_role_already_has_login(checkpoint_file: str) -> None:
+    """Promotion recovery aborts if role already has rolcanlogin=True."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": True},
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(PrivilegeVerificationError, match="Promotion aborted"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert not any("ALTER ROLE" in q and "LOGIN;" in q for q in admin_conn.executed_statements)
+
+
+def test_promote_role_fails_when_keychain_item_missing(checkpoint_file: str) -> None:
+    """Promotion recovery fails if Keychain entry does not exist."""
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = False
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier("test"),
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(SecretStoreError, match="not found in macOS Keychain"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert not any("ALTER ROLE" in q and "LOGIN;" in q for q in admin_conn.executed_statements)
+
+
+def test_promote_role_fails_when_keychain_password_empty(checkpoint_file: str) -> None:
+    """Promotion recovery fails if password retrieved from Keychain is empty."""
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = ""
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier("test"),
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(SecretStoreError, match="Retrieved empty password from Keychain"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert not any("ALTER ROLE" in q and "LOGIN;" in q for q in admin_conn.executed_statements)
+
+
+def test_promote_role_fails_when_scram_verifier_missing_in_pg_authid(
+    checkpoint_file: str,
+) -> None:
+    """Promotion recovery fails if pg_authid returns no password hash/verifier."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=None,  # missing verifier
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(PrivilegeVerificationError, match="No password hash/verifier found"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert not any("ALTER ROLE" in q and "LOGIN;" in q for q in admin_conn.executed_statements)
+
+
+def test_promote_role_fails_when_scram_verifier_mismatch(checkpoint_file: str) -> None:
+    """Promotion recovery aborts if Keychain password does not match the SCRAM verifier."""
+    keychain_pwd = "keychain-stored-password-abc"
+    different_pwd = "different-actual-database-password-xyz"
+
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = keychain_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier(different_pwd),
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(
+        SecretStoreError, match="does not match the active PostgreSQL SCRAM-SHA-256"
+    ):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert not any("ALTER ROLE" in q and "LOGIN;" in q for q in admin_conn.executed_statements)
+
+
+def test_promote_role_fails_when_structural_restrictions_fail_pre_promotion(
+    checkpoint_file: str,
+) -> None:
+    """Promotion recovery aborts if role has unauthorized privilege flags before promotion."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False, "rolsuper": True},  # Unauthorized superuser flag
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(PrivilegeVerificationError, match="rolsuper is true"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert not any("ALTER ROLE" in q and "LOGIN;" in q for q in admin_conn.executed_statements)
+
+
+def test_promote_role_auto_containment_on_app_connection_failure(
+    checkpoint_file: str,
+) -> None:
+    """Post-promotion app connection failure triggers immediate automatic NOLOGIN containment."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+    )
+
+    class FailingAppConnector(MockDatabaseConnector):
+        async def connect(
+            self,
+            host: str,
+            port: int,
+            user: str,
+            password: str,
+            database: str,
+            ssl_context: ssl.SSLContext | None = None,
+        ) -> Any:
+            if user == APP_ROLE:
+                raise RuntimeError("Simulated TLS handshake timeout on app role connection")
+            return await super().connect(host, port, user, password, database, ssl_context)
+
+    connector = FailingAppConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(ProvisioningError, match="Auto-containment successfully reverted"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert provisioner.state == ProvisioningState.CONTAINMENT_EXECUTED
+    assert admin_conn.role_flags["rolcanlogin"] is False
+
+
+def test_promote_role_auto_containment_on_app_auth_query_failure(
+    checkpoint_file: str,
+) -> None:
+    """Post-promotion app auth query failure triggers immediate automatic NOLOGIN containment."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+    )
+    app_conn = MockDbConn(
+        current_user=APP_ROLE,
+        session_user=APP_ROLE,
+        role_exists=True,
+        role_flags={"rolcanlogin": True},
+        throw_on_auth_query=True,
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn, app_conn=app_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(ProvisioningError, match="Auto-containment successfully reverted"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert provisioner.state == ProvisioningState.CONTAINMENT_EXECUTED
+    assert admin_conn.role_flags["rolcanlogin"] is False
+
+
+def test_promote_role_auto_containment_on_app_privilege_verification_failure(
+    checkpoint_file: str,
+) -> None:
+    """Post-promotion privilege verification failure on app_conn triggers containment."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+    )
+    app_conn = MockDbConn(
+        current_user=APP_ROLE,
+        session_user=APP_ROLE,
+        role_exists=True,
+        role_flags={"rolcanlogin": True},
+        effective_privileges={
+            "can_connect": True,
+            "can_create_db": True,  # Unauthorized privilege!
+            "can_create_schema": False,
+            "can_use_schema": True,
+            "can_temp_db": True,
+        },
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn, app_conn=app_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(ProvisioningError, match="Auto-containment successfully reverted"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert provisioner.state == ProvisioningState.CONTAINMENT_EXECUTED
+    assert admin_conn.role_flags["rolcanlogin"] is False
+
+
+def test_promote_role_containment_failure_raises_containment_failure_error(
+    checkpoint_file: str,
+) -> None:
+    """Post-promotion failure with containment failure raises ContainmentFailureError."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+        throw_on_alter_nologin=True,
+    )
+    fresh_admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": True},
+        throw_on_alter_nologin=True,
+    )
+    app_conn = MockDbConn(
+        current_user=APP_ROLE,
+        session_user=APP_ROLE,
+        role_exists=True,
+        throw_on_auth_query=True,
+    )
+    connector = MockDatabaseConnector(
+        admin_conn=admin_conn,
+        fresh_admin_conn=fresh_admin_conn,
+        app_conn=app_conn,
+    )
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(ContainmentFailureError, match="EMERGENCY CONTAINMENT FAILED"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+    assert provisioner.state == ProvisioningState.CONTAINMENT_FAILED
+
+
+def test_promote_role_target_verification_failure(checkpoint_file: str) -> None:
+    """Promotion recovery fails if confirmed branch is incorrect."""
+    api = MockNeonApi()
+    mock_store = MagicMock()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch="wrong-branch",
+    )
+
+    with pytest.raises(TargetVerificationError, match="Confirmation failed"):
+        asyncio.run(provisioner.run_promotion_recovery(admin_password="valid-admin-password"))
+
+
+def test_dry_run_reports_keychain_and_scram_status(checkpoint_file: str) -> None:
+    """Dry run preflight checks Keychain and SCRAM verifier status when role exists."""
+    test_pwd = "my-secret-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+
+    scram_ver = make_mock_scram_verifier(test_pwd)
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=scram_ver,
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.DRY_RUN,
+    )
+
+    res = asyncio.run(provisioner.run_dry_run(admin_password="valid-admin-password"))
+    assert res["role_exists"] is True
+    assert res["keychain_verified"] is True
+    assert res["scram_match_verified"] is True
+
+
+def test_promote_role_stalled_structural_verification_after_login(
+    checkpoint_file: str,
+) -> None:
+    """Stalled structural verification after LOGIN times out and triggers containment."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+        stall_structural_after_login=True,
+    )
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(ProvisioningError, match="Auto-containment successfully reverted"):
+        asyncio.run(
+            provisioner.run_promotion_recovery(
+                admin_password="valid-admin-password",
+                step_timeout=0.05,
+            )
+        )
+
+    assert provisioner.state == ProvisioningState.CONTAINMENT_EXECUTED
+    assert admin_conn.role_flags["rolcanlogin"] is False
+
+
+def test_promote_role_committed_login_with_missing_acknowledgement(
+    checkpoint_file: str,
+) -> None:
+    """Missing acknowledgement during ALTER ROLE LOGIN conservatively triggers containment."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+        throw_on_alter_login=ConnectionResetError("Connection lost before ACK"),
+    )
+    fresh_admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": True},  # Assume server committed before drop
+    )
+    connector = MockDatabaseConnector(
+        admin_conn=admin_conn,
+        fresh_admin_conn=fresh_admin_conn,
+    )
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(ProvisioningError, match="Auto-containment successfully reverted"):
+        asyncio.run(
+            provisioner.run_promotion_recovery(
+                admin_password="valid-admin-password",
+                step_timeout=0.05,
+            )
+        )
+
+    assert provisioner.state == ProvisioningState.CONTAINMENT_EXECUTED
+    assert fresh_admin_conn.role_flags["rolcanlogin"] is False
+    # Ensure LOGIN was never retried automatically on fresh connection
+    for stmt in fresh_admin_conn.executed_statements:
+        assert "LOGIN;" not in stmt or "NOLOGIN;" in stmt
+
+
+def test_promote_role_timeout_triggered_containment_and_verified_readback(
+    checkpoint_file: str,
+) -> None:
+    """Stalled application connection times out, triggers containment and verified readback."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+    )
+    connector = MockDatabaseConnector(
+        admin_conn=admin_conn,
+        stall_on_app_connect=True,
+    )
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(ProvisioningError, match="Auto-containment successfully reverted"):
+        asyncio.run(
+            provisioner.run_promotion_recovery(
+                admin_password="valid-admin-password",
+                step_timeout=0.05,
+            )
+        )
+
+    assert provisioner.state == ProvisioningState.CONTAINMENT_EXECUTED
+    assert admin_conn.role_flags["rolcanlogin"] is False
+
+
+def test_promote_role_failed_containment_resulting_in_unverified(
+    checkpoint_file: str,
+) -> None:
+    """Failed containment after post-LOGIN failure leaves role UNVERIFIED/UNKNOWN."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+        throw_on_alter_nologin=True,
+    )
+    fresh_admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": True},
+        throw_on_alter_nologin=True,
+    )
+    app_conn = MockDbConn(
+        current_user=APP_ROLE,
+        session_user=APP_ROLE,
+        role_exists=True,
+        throw_on_auth_query=True,
+    )
+    connector = MockDatabaseConnector(
+        admin_conn=admin_conn,
+        fresh_admin_conn=fresh_admin_conn,
+        app_conn=app_conn,
+    )
+    api = MockNeonApi()
+    ckpt_mgr = CheckpointManager(checkpoint_file)
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=ckpt_mgr,
+        connector=connector,
+        mode=ProvisioningMode.PROMOTE,
+        confirmed_branch=STAGING_BRANCH_ID,
+    )
+
+    with pytest.raises(ContainmentFailureError, match="UNVERIFIED/UNKNOWN"):
+        asyncio.run(
+            provisioner.run_promotion_recovery(
+                admin_password="valid-admin-password",
+                step_timeout=0.05,
+            )
+        )
+
+    assert provisioner.state == ProvisioningState.CONTAINMENT_FAILED
+
+
+def test_promote_role_cleanup_cancellation_preserves_containment_failure_error(
+    checkpoint_file: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Cleanup cancellation must never mask primary ContainmentFailureError."""
+    test_pwd = "staging-password"
+    mock_store = MagicMock()
+    mock_store.entry_exists.return_value = True
+    mock_store.get_password.return_value = test_pwd
+    mock_store.verify_stored_password.return_value = True
+
+    admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": False},
+        scram_verifier=make_mock_scram_verifier(test_pwd),
+        throw_on_alter_nologin=True,
+        throw_on_close_exc=asyncio.CancelledError("Simulated cleanup cancellation"),
+    )
+    fresh_admin_conn = MockDbConn(
+        role_exists=True,
+        role_flags={"rolcanlogin": True},
+        throw_on_alter_nologin=True,
+        throw_on_close_exc=asyncio.CancelledError("Simulated fresh cleanup cancellation"),
+    )
+    app_conn = MockDbConn(
+        current_user=APP_ROLE,
+        session_user=APP_ROLE,
+        role_exists=True,
+        throw_on_auth_query=True,
+        throw_on_close_exc=asyncio.CancelledError("Simulated app cleanup cancellation"),
+    )
+    connector = MockDatabaseConnector(
+        admin_conn=admin_conn,
+        fresh_admin_conn=fresh_admin_conn,
+        app_conn=app_conn,
+    )
+    api = MockNeonApi()
+
+    # Verify directly via CLI entrypoint: exit code 1 (not 130) and stderr reports UNVERIFIED
+    code = cli_entrypoint(
+        [
+            "--promote-role",
+            "--confirm-branch",
+            STAGING_BRANCH_ID,
+            "--checkpoint-file",
+            checkpoint_file,
+        ],
+        api_client=api,
+        secret_store=mock_store,
+        connector=connector,
+        admin_password="valid-admin-password",
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert code != 130
+    assert "UNVERIFIED" in captured.err or "CONTAINMENT FAILED" in captured.err
+    assert "Operation cancelled by user or signal" not in captured.err

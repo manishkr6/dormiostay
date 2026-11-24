@@ -16,11 +16,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import ctypes
 import ctypes.util
 import datetime
 import enum
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -65,6 +69,7 @@ DEFAULT_HTTP_TIMEOUT: float = 10.0
 DEFAULT_MAX_RESPONSE_BYTES: int = 2 * 1024 * 1024  # 2MB
 DEFAULT_CHUNK_SIZE: int = 64 * 1024  # 64KB
 CONTAINMENT_OVERALL_DEADLINE: float = 15.0
+DEFAULT_PROMOTION_STEP_TIMEOUT: float = 5.0
 
 # macOS Security.framework OSStatus error codes & constants
 ERR_SEC_SUCCESS = 0
@@ -82,6 +87,7 @@ class ProvisioningMode(str, enum.Enum):
     DRY_RUN = "dry-run"
     EXECUTE = "execute"
     CONTAIN = "contain"
+    PROMOTE = "promote"
 
 
 class ProvisioningState(str, enum.Enum):
@@ -135,6 +141,53 @@ def _is_valid_uuid(val: Any) -> bool:
         return False
 
 
+def verify_scram_sha256(password: str, verifier: str) -> bool:
+    """Cryptographically verify password against a PostgreSQL SCRAM-SHA-256 verifier (RFC 5802).
+
+    PostgreSQL SCRAM verifiers are formatted as:
+    SCRAM-SHA-256$<iterations>:<salt_base64>$<stored_key_base64>:<server_key_base64>
+    """
+    if not isinstance(verifier, str) or not isinstance(password, str):
+        return False
+    if not verifier.startswith("SCRAM-SHA-256$"):
+        return False
+    parts = verifier.split("$")
+    if len(parts) != 3 or parts[0] != "SCRAM-SHA-256":
+        return False
+
+    iter_salt = parts[1].split(":")
+    if len(iter_salt) != 2:
+        return False
+    try:
+        iterations = int(iter_salt[0])
+        if iterations < 1:
+            return False
+        salt = base64.b64decode(iter_salt[1], validate=True)
+    except (ValueError, binascii.Error):
+        return False
+
+    keys = parts[2].split(":")
+    if len(keys) != 2:
+        return False
+    try:
+        stored_key_expected = base64.b64decode(keys[0], validate=True)
+        server_key_expected = base64.b64decode(keys[1], validate=True)
+    except (ValueError, binascii.Error):
+        return False
+
+    if len(stored_key_expected) != 32 or len(server_key_expected) != 32:
+        return False
+
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+
+    return hmac.compare_digest(stored_key, stored_key_expected) and hmac.compare_digest(
+        server_key, server_key_expected
+    )
+
+
 async def _safe_close_or_terminate(conn: Any, timeout: float = 3.0) -> None:
     """Safely close connection within timeout; fallback to terminate() to prevent hangs."""
     if conn is None:
@@ -158,7 +211,10 @@ async def _safe_close_or_terminate(conn: Any, timeout: float = 3.0) -> None:
                 try:
                     res = term_fn()
                     if asyncio.iscoroutine(res):
-                        await asyncio.wait_for(res, timeout=1.0)
+                        try:
+                            await asyncio.shield(asyncio.wait_for(res, timeout=1.0))
+                        except BaseException:
+                            pass
                 except Exception:
                     pass
             raise
@@ -167,7 +223,10 @@ async def _safe_close_or_terminate(conn: Any, timeout: float = 3.0) -> None:
         try:
             res = term_fn()
             if asyncio.iscoroutine(res):
-                await asyncio.wait_for(res, timeout=1.0)
+                try:
+                    await asyncio.shield(asyncio.wait_for(res, timeout=1.0))
+                except BaseException:
+                    pass
         except Exception:
             pass
 
@@ -1980,6 +2039,10 @@ class StagingRoleProvisioner:
 
     async def verify_pg_tls_and_identity(self, conn: Any) -> None:
         """Verify PostgreSQL identity, current user, session user, database, and enforce TLS."""
+        await self.verify_pg_tls_and_role_identity(conn, expected_user=ADMIN_ROLE)
+
+    async def verify_pg_tls_and_role_identity(self, conn: Any, expected_user: str) -> None:
+        """Verify PostgreSQL identity, database, and enforce TLS for any expected role."""
         conn_host = getattr(conn, "host", None)
         if conn_host and conn_host != EXPECTED_ENDPOINT_HOST:
             raise TargetVerificationError(
@@ -1999,10 +2062,11 @@ class StagingRoleProvisioner:
             raise TargetVerificationError("Failed to fetch connection identity and TLS status.")
 
         user, s_user, db, ssl_active = row[0], row[1], row[2], row[3]
-        if user != ADMIN_ROLE or s_user != ADMIN_ROLE:
+        if user != expected_user or s_user != expected_user:
+            label = "Admin" if expected_user == ADMIN_ROLE else "Role"
             msg = (
-                f"Admin identity mismatch: user='{user}', "
-                f"session_user='{s_user}', expected '{ADMIN_ROLE}'"
+                f"{label} identity mismatch: user='{user}', "
+                f"session_user='{s_user}', expected '{expected_user}'"
             )
             raise TargetVerificationError(msg)
         if db != EXPECTED_DATABASE:
@@ -2766,6 +2830,8 @@ class StagingRoleProvisioner:
         role_exists = False
         db_verified = False
         effective_temp_str = "NOT VERIFIED (NO ADMIN CONNECTION)"
+        keychain_verified: bool | None = None
+        scram_match_verified: bool | None = None
 
         if admin_password:
             admin_conn = await self.connector.connect(
@@ -2784,6 +2850,23 @@ class StagingRoleProvisioner:
                     )
                     curr_login = bool(role_row[0]) if role_row else False
                     await self.verify_structural_restrictions(admin_conn, expect_login=curr_login)
+
+                    # Check Keychain & SCRAM verifier status
+                    keychain_verified = self.secret_store.entry_exists()
+                    if keychain_verified:
+                        try:
+                            authid_row = await admin_conn.fetchrow(
+                                "SELECT rolpassword FROM pg_authid WHERE rolname = $1;", APP_ROLE
+                            )
+                            if authid_row and authid_row[0]:
+                                pwd = self.secret_store.get_password()
+                                if pwd and verify_scram_sha256(pwd, str(authid_row[0])):
+                                    scram_match_verified = True
+                                else:
+                                    scram_match_verified = False
+                        except Exception:
+                            scram_match_verified = False
+
                 effective_temp_str = self.format_temporary_privilege_evidence(
                     public_temp=self._last_public_can_temp_db,
                     app_temp=self._last_can_temp_db,
@@ -2809,6 +2892,8 @@ class StagingRoleProvisioner:
             "public_baseline_temporary": self._last_public_can_temp_db,
             "effective_application_temporary": effective_temp_str,
             "backend_ssl_active": self._last_backend_ssl_active,
+            "keychain_verified": keychain_verified,
+            "scram_match_verified": scram_match_verified,
             "target": {
                 "project_id": PROJECT_ID,
                 "branch_id": STAGING_BRANCH_ID,
@@ -2819,7 +2904,11 @@ class StagingRoleProvisioner:
             "status": "PASS" if db_verified else "PARTIAL",
         }
 
-    async def run_provisioning(self, admin_password: str) -> None:
+    async def run_provisioning(
+        self,
+        admin_password: str,
+        step_timeout: float = DEFAULT_PROMOTION_STEP_TIMEOUT,
+    ) -> None:
         """Execute full staging provisioning state machine."""
         if self.mode != ProvisioningMode.EXECUTE:
             raise ProvisioningError("Execution mode not activated.")
@@ -2998,6 +3087,7 @@ class StagingRoleProvisioner:
 
         login_transition_entered = False
         app_conn: Any | None = None
+        primary_exc: BaseException | None = None
         try:
             await self.verify_pg_tls_and_identity(fresh_admin_conn)
             await self.verify_structural_restrictions(fresh_admin_conn, expect_login=False)
@@ -3011,14 +3101,20 @@ class StagingRoleProvisioner:
             try:
                 # Step 12: Enable LOGIN with Fail-Closed Containment Guard
                 login_transition_entered = True
-                await fresh_admin_conn.execute(f"ALTER ROLE {APP_ROLE} LOGIN;")
+                await asyncio.wait_for(
+                    fresh_admin_conn.execute(f"ALTER ROLE {APP_ROLE} LOGIN;"),
+                    timeout=step_timeout,
+                )
                 self.state = ProvisioningState.LOGIN_ENABLED
                 self.checkpoint.record(
                     self.state, step_number=12, details=f"Enabled LOGIN on {APP_ROLE}"
                 )
 
                 # Step 13: Verify Structural Restrictions (Assert LOGIN = True)
-                await self.verify_structural_restrictions(fresh_admin_conn, expect_login=True)
+                await asyncio.wait_for(
+                    self.verify_structural_restrictions(fresh_admin_conn, expect_login=True),
+                    timeout=step_timeout,
+                )
                 temp_evidence = self.format_temporary_privilege_evidence(
                     self._last_public_can_temp_db, self._last_can_temp_db, role_exists=True
                 )
@@ -3040,14 +3136,25 @@ class StagingRoleProvisioner:
                     raise SecretStoreError(
                         "Keychain retrieval mismatch prior to application authentication."
                     )
-                app_conn = await self.connector.connect(
-                    host=EXPECTED_ENDPOINT_HOST,
-                    port=EXPECTED_ENDPOINT_PORT,
-                    user=APP_ROLE,
-                    password=keychain_pwd,
-                    database=EXPECTED_DATABASE,
+                app_conn = await asyncio.wait_for(
+                    self.connector.connect(
+                        host=EXPECTED_ENDPOINT_HOST,
+                        port=EXPECTED_ENDPOINT_PORT,
+                        user=APP_ROLE,
+                        password=keychain_pwd,
+                        database=EXPECTED_DATABASE,
+                    ),
+                    timeout=step_timeout,
                 )
-                auth_row = await app_conn.fetchrow("SELECT current_user, session_user;")
+                assert app_conn is not None
+                await asyncio.wait_for(
+                    self.verify_pg_tls_and_role_identity(app_conn, expected_user=APP_ROLE),
+                    timeout=step_timeout,
+                )
+                auth_row = await asyncio.wait_for(
+                    app_conn.fetchrow("SELECT current_user, session_user;"),
+                    timeout=step_timeout,
+                )
                 if not auth_row or auth_row[0] != APP_ROLE or auth_row[1] != APP_ROLE:
                     raise PrivilegeVerificationError(
                         "Authentication check mismatch between current_user and session_user."
@@ -3060,11 +3167,20 @@ class StagingRoleProvisioner:
                     details="Role provisioning completed and authenticated successfully",
                 )
             except BaseException as post_login_err:
+                primary_exc = post_login_err
                 if login_transition_entered:
-                    await self.attempt_auto_containment(
-                        fresh_admin_conn, post_login_err, admin_password=admin_password
-                    )
+                    try:
+                        await self.attempt_auto_containment(
+                            fresh_admin_conn, post_login_err, admin_password=admin_password
+                        )
+                    except BaseException as containment_err:
+                        primary_exc = containment_err
+                        raise
                 raise
+        except BaseException as e:
+            if primary_exc is None:
+                primary_exc = e
+            raise
         finally:
             # Independent cleanup blocks ensuring app_conn cleanup failure or cancellation
             # never skips fresh_admin_conn cleanup
@@ -3080,6 +3196,248 @@ class StagingRoleProvisioner:
                 await _safe_close_or_terminate(fresh_admin_conn, timeout=3.0)
             except BaseException as e:
                 admin_exc = e
+
+            # Critical containment failure preservation:
+            # If containment failed (or primary_exc is ContainmentFailureError),
+            # that failure MUST NEVER be overwritten by secondary cleanup errors or cancellations.
+            if self.state == ProvisioningState.CONTAINMENT_FAILED or isinstance(
+                primary_exc, ContainmentFailureError
+            ):
+                if primary_exc is not None:
+                    raise primary_exc from None
+                msg = (
+                    f"CRITICAL: Emergency containment failed. Role '{APP_ROLE}' "
+                    "login status is UNVERIFIED/UNKNOWN. Immediate manual containment required."
+                )
+                raise ContainmentFailureError(msg)
+
+            if primary_exc is not None:
+                raise primary_exc from None
+
+            if app_exc is not None:
+                raise app_exc
+            if admin_exc is not None:
+                raise admin_exc
+
+    async def run_promotion_recovery(
+        self,
+        admin_password: str,
+        verify_only: bool = False,
+        step_timeout: float = DEFAULT_PROMOTION_STEP_TIMEOUT,
+    ) -> None:
+        """Execute safe promotion recovery of verified staging role from NOLOGIN to LOGIN."""
+        if self.mode != ProvisioningMode.PROMOTE:
+            raise ProvisioningError("Promotion mode not activated.")
+
+        if self.confirmed_branch != STAGING_BRANCH_ID:
+            msg = f"Confirmation failed. Expected '--confirm-branch {STAGING_BRANCH_ID}'"
+            raise TargetVerificationError(msg)
+
+        if not admin_password:
+            raise ProvisioningError("Administrator password is required for role promotion.")
+
+        self.redactor.register(admin_password)
+
+        # Step 1: Verify Fresh Target Metadata from Neon API
+        await self.async_verify_target_metadata()
+
+        # Step 2: Establish Administrative Connection & Verify TLS
+        admin_conn = await self.connector.connect(
+            host=EXPECTED_ENDPOINT_HOST,
+            port=EXPECTED_ENDPOINT_PORT,
+            user=ADMIN_ROLE,
+            password=admin_password,
+            database=EXPECTED_DATABASE,
+        )
+
+        login_transition_entered = False
+        app_conn: Any | None = None
+        primary_exc: BaseException | None = None
+
+        try:
+            await self.verify_pg_tls_and_identity(admin_conn)
+
+            # Step 3: Baseline Verification - Role MUST already exist
+            role_exists = await self.verify_baseline_privileges(admin_conn)
+            if not role_exists:
+                msg = (
+                    f"Role '{APP_ROLE}' does not exist in database. "
+                    "Cannot promote non-existent role."
+                )
+                raise PrivilegeVerificationError(msg)
+
+            # Step 4: Verify role currently has NOLOGIN
+            role_row = await admin_conn.fetchrow(
+                "SELECT rolcanlogin FROM pg_roles WHERE rolname = $1;", APP_ROLE
+            )
+            if not role_row or not _is_exact_bool(role_row[0], False):
+                curr_status = role_row[0] if role_row else "NOT_FOUND"
+                raise PrivilegeVerificationError(
+                    f"Role '{APP_ROLE}' does not have NOLOGIN (rolcanlogin={curr_status}). "
+                    "Promotion aborted to prevent modifying already-promoted or unexpected role."
+                )
+
+            # Step 5: Verify all structural restrictions and least-privilege attributes
+            await self.verify_structural_restrictions(admin_conn, expect_login=False)
+
+            # Step 6: Verify Keychain credential exists and matches SCRAM-SHA-256 verifier
+            if not self.secret_store.entry_exists():
+                msg = (
+                    f"Credential for '{KEYCHAIN_ACCOUNT}' not found "
+                    f"in macOS Keychain under service '{KEYCHAIN_SERVICE}'."
+                )
+                raise SecretStoreError(msg)
+
+            keychain_pwd = self.secret_store.get_password()
+            if not keychain_pwd:
+                raise SecretStoreError("Retrieved empty password from Keychain.")
+            self.redactor.register(keychain_pwd)
+
+            if not self.secret_store.verify_stored_password(expected_password=keychain_pwd):
+                raise SecretStoreError(
+                    "Keychain durable verification failed: retrieved password mismatch."
+                )
+
+            authid_row = await admin_conn.fetchrow(
+                "SELECT rolpassword FROM pg_authid WHERE rolname = $1;", APP_ROLE
+            )
+            if not authid_row or not authid_row[0]:
+                raise PrivilegeVerificationError(
+                    f"No password hash/verifier found for '{APP_ROLE}' in pg_authid."
+                )
+
+            scram_verifier = str(authid_row[0])
+            self.redactor.register(scram_verifier)
+
+            if not verify_scram_sha256(keychain_pwd, scram_verifier):
+                msg = (
+                    "Stored Keychain credential does not match the active "
+                    "PostgreSQL SCRAM-SHA-256 verifier."
+                )
+                raise SecretStoreError(msg)
+
+            self.state = ProvisioningState.PRIVILEGES_VERIFIED
+            details_msg = (
+                "Promotion preflight verified: role exists with NOLOGIN, "
+                "privileges intact, Keychain matches SCRAM verifier."
+            )
+            self.checkpoint.record(self.state, step_number=11, details=details_msg)
+
+            if verify_only:
+                return
+
+            try:
+                # Step 7: Enable LOGIN with Fail-Closed Containment Guard
+                login_transition_entered = True
+                await asyncio.wait_for(
+                    admin_conn.execute(f"ALTER ROLE {APP_ROLE} LOGIN;"),
+                    timeout=step_timeout,
+                )
+                self.state = ProvisioningState.LOGIN_ENABLED
+                self.checkpoint.record(
+                    self.state, step_number=12, details=f"Enabled LOGIN on {APP_ROLE}"
+                )
+
+                # Step 8: Verify Structural Restrictions (Assert LOGIN = True)
+                await asyncio.wait_for(
+                    self.verify_structural_restrictions(admin_conn, expect_login=True),
+                    timeout=step_timeout,
+                )
+                temp_evidence = self.format_temporary_privilege_evidence(
+                    self._last_public_can_temp_db, self._last_can_temp_db, role_exists=True
+                )
+                temp_status_msg = (
+                    f"PUBLIC database TEMPORARY: {self._last_public_can_temp_db}; "
+                    f"App effective TEMPORARY: {temp_evidence}"
+                )
+                self.checkpoint.record(
+                    self.state,
+                    step_number=13,
+                    details=f"Structural checks passed with LOGIN=True. {temp_status_msg}",
+                )
+
+                # Step 9: Mandatory Authentication Test Using Retrieved Keychain Password
+                app_conn = await asyncio.wait_for(
+                    self.connector.connect(
+                        host=EXPECTED_ENDPOINT_HOST,
+                        port=EXPECTED_ENDPOINT_PORT,
+                        user=APP_ROLE,
+                        password=keychain_pwd,
+                        database=EXPECTED_DATABASE,
+                    ),
+                    timeout=step_timeout,
+                )
+                assert app_conn is not None
+                await asyncio.wait_for(
+                    self.verify_pg_tls_and_role_identity(app_conn, expected_user=APP_ROLE),
+                    timeout=step_timeout,
+                )
+                auth_row = await asyncio.wait_for(
+                    app_conn.fetchrow("SELECT current_user, session_user;"),
+                    timeout=step_timeout,
+                )
+                if not auth_row or auth_row[0] != APP_ROLE or auth_row[1] != APP_ROLE:
+                    raise PrivilegeVerificationError(
+                        "Authentication check mismatch between current_user and session_user."
+                    )
+
+                # Step 10: Re-verify structural restrictions through live application connection
+                await asyncio.wait_for(
+                    self.verify_structural_restrictions(app_conn, expect_login=True),
+                    timeout=step_timeout,
+                )
+
+                self.state = ProvisioningState.COMPLETED
+                self.checkpoint.record(
+                    self.state,
+                    step_number=14,
+                    details="Role promotion completed and authenticated successfully",
+                )
+            except BaseException as post_login_err:
+                primary_exc = post_login_err
+                if login_transition_entered:
+                    try:
+                        await self.attempt_auto_containment(
+                            admin_conn, post_login_err, admin_password=admin_password
+                        )
+                    except BaseException as containment_err:
+                        primary_exc = containment_err
+                        raise
+                raise
+        except BaseException as e:
+            if primary_exc is None:
+                primary_exc = e
+            raise
+        finally:
+            app_exc: BaseException | None = None
+            if app_conn is not None:
+                try:
+                    await _safe_close_or_terminate(app_conn, timeout=3.0)
+                except BaseException as e:
+                    app_exc = e
+
+            admin_exc: BaseException | None = None
+            try:
+                await _safe_close_or_terminate(admin_conn, timeout=3.0)
+            except BaseException as e:
+                admin_exc = e
+
+            # Critical containment failure preservation:
+            # If containment failed (or primary_exc is ContainmentFailureError),
+            # that failure MUST NEVER be overwritten by secondary cleanup errors or cancellations.
+            if self.state == ProvisioningState.CONTAINMENT_FAILED or isinstance(
+                primary_exc, ContainmentFailureError
+            ):
+                if primary_exc is not None:
+                    raise primary_exc from None
+                msg = (
+                    f"CRITICAL: Emergency containment failed. Role '{APP_ROLE}' "
+                    "login status is UNVERIFIED/UNKNOWN. Immediate manual containment required."
+                )
+                raise ContainmentFailureError(msg)
+
+            if primary_exc is not None:
+                raise primary_exc from None
 
             if app_exc is not None:
                 raise app_exc
@@ -3108,6 +3466,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--contain-role",
         action="store_true",
         help="Emergency containment: set dormiostay_app to NOLOGIN (requires --confirm-branch)",
+    )
+    mode_group.add_argument(
+        "--promote-role",
+        action="store_true",
+        help="Promote verified staging role from NOLOGIN to LOGIN (requires --confirm-branch)",
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help=(
+            "When used with --promote-role, verify all promotion pre-conditions "
+            "without altering the role to LOGIN"
+        ),
     )
     parser.add_argument(
         "--confirm-branch",
@@ -3269,12 +3640,22 @@ def cli_entrypoint(
 
     if args.contain_role:
         mode = ProvisioningMode.CONTAIN
+    elif args.promote_role:
+        mode = ProvisioningMode.PROMOTE
     elif args.execute:
         mode = ProvisioningMode.EXECUTE
     else:
         mode = ProvisioningMode.DRY_RUN
 
     print(f"[*] Mode: {mode.value}")
+
+    # Guard 0: --verify-only is only permitted with --promote-role
+    if args.verify_only and mode != ProvisioningMode.PROMOTE:
+        print(
+            "[!] FATAL: '--verify-only' is only supported with '--promote-role'.",
+            file=sys.stderr,
+        )
+        return 1
 
     # Guard 1: Strict production branch rejection across all modes
     if args.confirm_branch == PRODUCTION_BRANCH_ID or args.confirm_branch == PRODUCTION_BRANCH_NAME:
@@ -3300,6 +3681,14 @@ def cli_entrypoint(
         )
         return 1
 
+    # Guard 4: Promotion requires explicit staging branch confirmation
+    if mode == ProvisioningMode.PROMOTE and args.confirm_branch != STAGING_BRANCH_ID:
+        print(
+            f"[!] FATAL: Promotion mode requires '--confirm-branch {STAGING_BRANCH_ID}'",
+            file=sys.stderr,
+        )
+        return 1
+
     api_key = os.environ.get("NEON_API_KEY", "")
     if api_client is None:
         if not api_key:
@@ -3307,6 +3696,7 @@ def cli_entrypoint(
             return 1
         api_client = NeonApiClient(api_key=api_key)
 
+    provisioner: StagingRoleProvisioner | None = None
     try:
         if secret_store is None:
             secret_store = SecretStore()
@@ -3348,6 +3738,20 @@ def cli_entrypoint(
                     else "False (backend observation; client TLS verified separately)"
                 )
                 print(f"    Backend pg_stat_ssl:           {backend_ssl_label}")
+            if res.get("role_exists"):
+                kc_label = (
+                    "Present"
+                    if res.get("keychain_verified") is True
+                    else ("Absent" if res.get("keychain_verified") is False else "Not checked")
+                )
+                print(f"    Keychain Item:                 {kc_label}")
+                if res.get("scram_match_verified") is not None:
+                    scram_label = (
+                        "True (cryptographically verified)"
+                        if res["scram_match_verified"]
+                        else "False (verifier mismatch or unavailable)"
+                    )
+                    print(f"    SCRAM-SHA-256 Match:           {scram_label}")
             print(f"    Status:   {res['status']}")
             if not res["database_verified"]:
                 msg = (
@@ -3373,6 +3777,32 @@ def cli_entrypoint(
             print(f"[+] Emergency containment SUCCESSFUL: '{APP_ROLE}' set to NOLOGIN.")
             return 0
 
+        if mode == ProvisioningMode.PROMOTE:
+            if not db_pwd:
+                msg = (
+                    f"[!] FATAL: Administrator password in ${args.admin_password_env} "
+                    "required for role promotion."
+                )
+                print(msg, file=sys.stderr)
+                return 1
+            _run_with_bounded_sigint_handling(
+                provisioner.run_promotion_recovery(
+                    admin_password=db_pwd,
+                    verify_only=args.verify_only,
+                )
+            )
+            if args.verify_only:
+                print(
+                    f"[+] Promotion pre-conditions VERIFIED for '{APP_ROLE}' "
+                    "(no database mutations performed; role remains NOLOGIN)."
+                )
+            else:
+                print(
+                    f"[+] Promotion and application verification COMPLETED "
+                    f"successfully for '{APP_ROLE}'."
+                )
+            return 0
+
         if mode == ProvisioningMode.EXECUTE:
             if not db_pwd:
                 msg = (
@@ -3386,6 +3816,14 @@ def cli_entrypoint(
             return 0
 
     except (KeyboardInterrupt, asyncio.CancelledError):
+        if provisioner is not None and provisioner.state == ProvisioningState.CONTAINMENT_FAILED:
+            print(
+                "[!] CRITICAL: Emergency containment failed. Role 'dormiostay_app' is in "
+                "UNVERIFIED or potentially LOGIN-enabled state. Immediate manual containment "
+                "required!",
+                file=sys.stderr,
+            )
+            return 1
         print("[!] Operation cancelled by user or signal.", file=sys.stderr)
         return 130
     except ProvisioningError as pe:

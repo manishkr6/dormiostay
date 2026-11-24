@@ -10,7 +10,7 @@
 
 ## 1. Executive Summary & Astra Blocker Remediations
 
-Following independent security audits and adversarial self-review of `apps/api/scripts/provision_neon_staging_role.py`, all identified defects have been comprehensively resolved in local code and independently validated with **252 dedicated offline unit tests** (325 tests across the full API unit suite):
+Following independent security audits and adversarial self-review of `apps/api/scripts/provision_neon_staging_role.py`, all identified defects have been comprehensively resolved in local code and independently validated with **273 dedicated offline unit tests** (346 tests across the full API unit suite):
 
 1. **Astra Fourth-SIGINT & Signal Boundary Remediations — Safe Routing & Shutdown Error Preservation:**  
    - **Dedicated Signal-Routing Runner:** Replaces standard `asyncio.run()` with `_run_with_bounded_sigint_handling[T](coro)` across all CLI modes (`--dry-run`, `--contain-role`, and `--execute`).
@@ -159,6 +159,38 @@ python apps/api/scripts/provision_neon_staging_role.py \
   --confirm-branch br-weathered-dust-bim5fibs
 ```
 
+### 4.4 Role Promotion Recovery Mode (`--promote-role`)
+When `dormiostay_app` has already been created in `NOLOGIN` state, restricted attributes and grants were applied, the Neon API password reset completed, and the resulting credential was durably saved in macOS Keychain, standard `--execute` halts to avoid recreation or overwrite. The `--promote-role` mode safely and deterministically completes Gate 2 without password resets or role recreation.
+
+```bash
+# Optional verify-only preflight: tests all 7 pre-conditions without database mutations
+python apps/api/scripts/provision_neon_staging_role.py \
+  --promote-role \
+  --verify-only \
+  --confirm-branch br-weathered-dust-bim5fibs
+
+# Authorized promotion execution: verifies pre-conditions, enables LOGIN, tests live app auth
+python apps/api/scripts/provision_neon_staging_role.py \
+  --promote-role \
+  --confirm-branch br-weathered-dust-bim5fibs
+```
+
+**Required Pre-Promotion Verification Checks (Fail-Closed Prior to Mutation):**
+1. **Target Metadata:** Neon control plane verifies staging project `small-dew-81510029`, branch `br-weathered-dust-bim5fibs`, endpoint `ep-cold-smoke-bir1s74t...`, and database `neondb`.
+2. **Administrative TLS:** Dedicated administrative connection over verified TLS with role and database assertions.
+3. **Role Existence:** Role `dormiostay_app` must already exist in `pg_roles`.
+4. **NOLOGIN Enforced:** `rolcanlogin = False` strictly asserted.
+5. **Least-Privilege Attributes:** Zero privileged flags (`rolsuper`, `rolcreatedb`, `rolcreaterole`, `rolreplication`, `rolbypassrls`), zero role memberships, zero database/schema/table/proc/type ownership, `CONNECT` on database, `USAGE` on public schema, zero database/schema `CREATE`.
+6. **Keychain Item Persistence:** Stored password retrieved and readback-verified from macOS Keychain service `dormiostay.neon.staging.dormiostay_app`.
+7. **Cryptographic SCRAM-SHA-256 Verifier Match:** Offline RFC 5802 PBKDF2/HMAC verification proves the Keychain password cryptographically matches `pg_authid.rolpassword` for `dormiostay_app` without exposing or logging secrets.
+
+**Promotion Transition & Automatic Containment:**
+- **Conservative Transition Guard:** `login_transition_entered = True` is set BEFORE initiating `ALTER ROLE dormiostay_app LOGIN;`. If execution times out or connection drops without acknowledgement, the system conservatively assumes LOGIN may have committed, immediately attempts emergency NOLOGIN containment, and never retries LOGIN automatically.
+- **Bounded Step Deadlines:** Every post-LOGIN step (`ALTER ROLE LOGIN`, admin structural verification, application connection, application TLS/identity verification, authentication query, and live application structural audit) is strictly bounded by `step_timeout` (`DEFAULT_PROMOTION_STEP_TIMEOUT = 5.0s`).
+- **Automated Fail-Closed Containment:** If ANY post-LOGIN step times out or fails, emergency containment (`ALTER ROLE dormiostay_app NOLOGIN;`) is immediately triggered with catalog readback verification.
+- **Containment Failure Preservation:** If emergency containment fails, `ContainmentFailureError` is recorded and strictly preserved through final cleanup. Secondary cleanup exceptions and `asyncio.CancelledError` signals during connection close/terminate are never permitted to overwrite or replace the primary `ContainmentFailureError`.
+- **CLI Truth-Telling:** When containment fails, the CLI reports `[!] CRITICAL: Emergency containment failed... UNVERIFIED/UNKNOWN` and exits nonzero (code 1), never code 130.
+
 ---
 
 ## 5. macOS Keychain Service Specification
@@ -187,6 +219,10 @@ python apps/api/scripts/provision_neon_staging_role.py \
 | **Cancellation during containment** | `asyncio.shield` + loop-await ensures inner task finishes; zero orphaned background tasks | Re-raises `CancelledError` only after verified security cleanup |
 | **Hanging connection close during containment** | `_safe_close_or_terminate()` times out at 2s/3s and invokes `conn.terminate()` | Connection dropped; emergency sequence proceeds |
 | **Cleanup error after containment SQL** | Isolated in `try...finally` with `BaseException` handling | Verified NOLOGIN outcome preserved |
+| **Partial Gate 2 interruption / Role exists with NOLOGIN** | `--promote-role` mode verifies all 7 pre-conditions and cryptographic SCRAM match before controlled LOGIN promotion | Reverts to NOLOGIN automatically if post-promotion app connection or privilege checks fail |
+| **Stalled promotion query or app auth** | Bounded `step_timeout` (`DEFAULT_PROMOTION_STEP_TIMEOUT = 5.0s`) times out post-LOGIN steps; automatically triggers emergency containment | Reverts to NOLOGIN; records `CONTAINMENT_EXECUTED` (or `CONTAINMENT_FAILED` if containment also fails) |
+| **Ambiguous ALTER ROLE LOGIN acknowledgement** | `login_transition_entered = True` armed before execution; timeouts or network drops conservatively assumed committed | Immediately triggers containment on fresh connection; never retries uncertain LOGIN automatically |
+| **Cleanup cancellation with failed containment** | Primary `ContainmentFailureError` strictly preserved across `finally` cleanup; secondary cancellations cannot mask failure | CLI reports `UNVERIFIED/UNKNOWN` and exits 1 (never exits 130) |
 | **Keychain Scope Resolution Failure** | `SecKeychainCopyDefault` error, exception, or NULL handle fails closed | Raises `SecretStoreError`; zero subsequent C API calls made |
 | **Ambiguous Keychain entries** | `_check_ambiguous_matches()` detects duplicate items (`count > 1`) | Fails closed with `SecretStoreError` |
 | **Checkpoint history corrupted or contaminated** | Strict allowlist schema validation and `contains_secret()` check on all historical records | Fails closed; preserves original file on disk for forensics |
