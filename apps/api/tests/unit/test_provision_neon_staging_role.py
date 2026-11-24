@@ -481,16 +481,15 @@ def test_verify_pg_tls_and_identity_database_mismatch(checkpoint_file: str) -> N
     assert "Database mismatch" in str(exc.value)
 
 
-def test_verify_pg_tls_and_identity_plaintext_rejected(checkpoint_file: str) -> None:
+def test_verify_pg_tls_and_identity_accepts_proxy_ssl_false(checkpoint_file: str) -> None:
     conn = MockDbConn(ssl_active=False, client_ssl_active=True)
     provisioner = StagingRoleProvisioner(
         api_client=MockNeonApi(),
         secret_store=MagicMock(),
         checkpoint_mgr=CheckpointManager(checkpoint_file),
     )
-    with pytest.raises(TargetVerificationError) as exc:
-        asyncio.run(provisioner.verify_pg_tls_and_identity(conn))
-    assert "TLS is NOT active on PostgreSQL connection" in str(exc.value)
+    asyncio.run(provisioner.verify_pg_tls_and_identity(conn))
+    assert provisioner._last_backend_ssl_active is False
 
 
 # ==============================================================================
@@ -2046,7 +2045,9 @@ def test_verify_structural_restrictions_records_inherited_temporary() -> None:
     assert provisioner._last_can_temp_db is True
 
 
-def test_verify_pg_tls_and_identity_rejects_ssl_active_false() -> None:
+def test_verify_pg_tls_and_identity_accepts_backend_ssl_active_false_when_client_tls_verified() -> (
+    None
+):
     api = MockNeonApi()
     conn = MockDbConn(ssl_active=False, client_ssl_active=True)
     provisioner = StagingRoleProvisioner(
@@ -2054,9 +2055,192 @@ def test_verify_pg_tls_and_identity_rejects_ssl_active_false() -> None:
         secret_store=MagicMock(),
         checkpoint_mgr=MagicMock(),
     )
+    asyncio.run(provisioner.verify_pg_tls_and_identity(conn))
+    assert provisioner._last_backend_ssl_active is False
+
+
+def test_verify_pg_tls_and_identity_accepts_backend_ssl_active_true() -> None:
+    api = MockNeonApi()
+    conn = MockDbConn(ssl_active=True, client_ssl_active=True)
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=MagicMock(),
+        checkpoint_mgr=MagicMock(),
+    )
+    asyncio.run(provisioner.verify_pg_tls_and_identity(conn))
+    assert provisioner._last_backend_ssl_active is True
+
+
+def test_verify_pg_tls_and_identity_handles_backend_ssl_null() -> None:
+    api = MockNeonApi()
+    conn = MockDbConn(ssl_active=None, client_ssl_active=True)
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=MagicMock(),
+        checkpoint_mgr=MagicMock(),
+    )
+    asyncio.run(provisioner.verify_pg_tls_and_identity(conn))
+    assert provisioner._last_backend_ssl_active is None
+
+
+def test_verify_client_tls_comprehensive() -> None:
+    from scripts.provision_neon_staging_role import _verify_client_tls
+
+    # 1. Connection with is_ssl() -> True
+    mock1 = MagicMock()
+    mock1.is_ssl.return_value = True
+    assert _verify_client_tls(mock1) is True
+
+    # 2. Connection with _protocol.is_ssl == True
+    mock2 = MagicMock(spec=["_protocol"])
+    mock2._protocol = MagicMock()
+    mock2._protocol.is_ssl = True
+    assert _verify_client_tls(mock2) is True
+
+    # 3. Connection with _transport.get_extra_info("ssl_object")
+    mock3 = MagicMock(spec=["_transport"])
+    mock3._transport = MagicMock()
+    mock3._transport.get_extra_info.side_effect = (
+        lambda key: MagicMock() if key == "ssl_object" else None
+    )
+    assert _verify_client_tls(mock3) is True
+
+    # 4. Connection with client_ssl = False
+    mock4 = MagicMock(spec=["_protocol", "_transport"])
+    mock4._protocol = MagicMock(is_ssl=False)
+    mock4._transport = MagicMock()
+    mock4._transport.get_extra_info.return_value = None
+    assert _verify_client_tls(mock4) is False
+
+    # 5. Empty object
+    class Empty:
+        pass
+
+    assert _verify_client_tls(Empty()) is False
+
+
+def test_database_connector_rejects_hostname_check_disabled() -> None:
+    connector = DatabaseConnector()
+    insecure_ctx = connector.build_ssl_context()
+    insecure_ctx.check_hostname = False
     with pytest.raises(TargetVerificationError) as exc:
-        asyncio.run(provisioner.verify_pg_tls_and_identity(conn))
-    assert "TLS is NOT active on PostgreSQL connection" in str(exc.value)
+        asyncio.run(
+            connector.connect(
+                host=EXPECTED_ENDPOINT_HOST,
+                port=EXPECTED_ENDPOINT_PORT,
+                user=ADMIN_ROLE,
+                password="test_password",
+                database=EXPECTED_DATABASE,
+                ssl_context=insecure_ctx,
+            )
+        )
+    assert "Insecure SSL context rejected: check_hostname and CERT_REQUIRED required." in str(
+        exc.value
+    )
+
+
+def test_database_connector_rejects_verify_mode_disabled() -> None:
+    connector = DatabaseConnector()
+    insecure_ctx = connector.build_ssl_context()
+    insecure_ctx.check_hostname = False
+    insecure_ctx.verify_mode = ssl.CERT_NONE
+    with pytest.raises(TargetVerificationError) as exc:
+        asyncio.run(
+            connector.connect(
+                host=EXPECTED_ENDPOINT_HOST,
+                port=EXPECTED_ENDPOINT_PORT,
+                user=ADMIN_ROLE,
+                password="test_password",
+                database=EXPECTED_DATABASE,
+                ssl_context=insecure_ctx,
+            )
+        )
+    assert "Insecure SSL context rejected: check_hostname and CERT_REQUIRED required." in str(
+        exc.value
+    )
+
+
+def test_representative_tls_handshake_rejects_untrusted_cert() -> None:
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        key_path = f"{tmpdir}/key.pem"
+        cert_path = f"{tmpdir}/cert.pem"
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                key_path,
+                "-out",
+                cert_path,
+                "-days",
+                "1",
+                "-subj",
+                "/CN=untrusted.neon.tech",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(cert_path, key_path)
+
+        connector = DatabaseConnector()
+        client_ctx = connector.build_ssl_context()
+
+        client_in = ssl.MemoryBIO()
+        client_out = ssl.MemoryBIO()
+        client_ssl = client_ctx.wrap_bio(
+            client_in, client_out, server_hostname="untrusted.neon.tech"
+        )
+
+        server_in = ssl.MemoryBIO()
+        server_out = ssl.MemoryBIO()
+        server_ssl = server_ctx.wrap_bio(server_in, server_out, server_side=True)
+
+        try:
+            client_ssl.do_handshake()
+        except ssl.SSLWantReadError:
+            pass
+        server_in.write(client_out.read())
+
+        try:
+            server_ssl.do_handshake()
+        except ssl.SSLWantReadError:
+            pass
+        client_in.write(server_out.read())
+
+        with pytest.raises(ssl.SSLCertVerificationError) as exc:
+            client_ssl.do_handshake()
+        assert "certificate verify failed" in str(exc.value)
+
+
+def test_dry_run_performs_zero_mutations_and_zero_keychain_writes() -> None:
+    api = MockNeonApi()
+    mock_store = MagicMock()
+    admin_conn = MockDbConn(ssl_active=False, client_ssl_active=True, role_exists=False)
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    checkpoint_mgr = MagicMock()
+
+    provisioner = StagingRoleProvisioner(
+        api_client=api,
+        secret_store=mock_store,
+        checkpoint_mgr=checkpoint_mgr,
+        connector=connector,
+        mode=ProvisioningMode.DRY_RUN,
+    )
+    res = asyncio.run(provisioner.run_dry_run(admin_password="test_admin_pwd"))
+    assert res["status"] == "PASS"
+    assert res["database_verified"] is True
+    assert res["backend_ssl_active"] is False
+    assert mock_store.store_password.call_count == 0
+    assert api.reset_called is False
+    assert not any("CREATE ROLE" in stmt for stmt in admin_conn.executed_statements)
 
 
 def test_verify_pg_tls_and_identity_rejects_client_is_ssl_false() -> None:

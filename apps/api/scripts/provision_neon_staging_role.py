@@ -286,9 +286,8 @@ def _verify_client_tls(conn: Any) -> bool:
         return bool(is_ssl_fn() is True)
 
     protocol = getattr(conn, "_protocol", None)
-    if protocol is not None and hasattr(protocol, "is_ssl"):
-        if type(protocol.is_ssl) is bool and protocol.is_ssl is True:
-            return True
+    if protocol is not None and getattr(protocol, "is_ssl", False) is True:
+        return True
 
     transport = getattr(conn, "_transport", None)
     if transport is not None and hasattr(transport, "get_extra_info"):
@@ -1239,6 +1238,7 @@ class DatabaseConnector:
 
     def __init__(self, redactor: SecretRedactor | None = None) -> None:
         self.redactor = redactor or GLOBAL_REDACTOR
+        self.last_backend_ssl_active: bool | None = None
 
     def build_ssl_context(self) -> ssl.SSLContext:
         ctx = ssl.create_default_context()
@@ -1321,10 +1321,9 @@ class DatabaseConnector:
                 raise TargetVerificationError(
                     "Client connection reports TLS is not active. Insecure connection terminated."
                 )
-            if not _is_exact_bool(ssl_active, True):
-                raise TargetVerificationError(
-                    "TLS is not active on established connection. Insecure connection terminated."
-                )
+            self.last_backend_ssl_active = (
+                bool(ssl_active) if isinstance(ssl_active, bool) else None
+            )
             return conn
         except BaseException as verify_err:
             await _safe_close_or_terminate(conn, timeout=3.0)
@@ -1870,6 +1869,7 @@ class StagingRoleProvisioner:
         self.state = ProvisioningState.INITIALIZED
         self._last_can_temp_db: bool | None = None
         self._last_public_can_temp_db: bool | None = None
+        self._last_backend_ssl_active: bool | None = None
         self._verified_endpoint_id: str | None = None
 
     async def _call_api_async(
@@ -2009,10 +2009,7 @@ class StagingRoleProvisioner:
             raise TargetVerificationError(
                 f"Database mismatch: expected '{EXPECTED_DATABASE}', connected to '{db}'"
             )
-        if not _is_exact_bool(ssl_active, True):
-            raise TargetVerificationError(
-                "TLS is NOT active on PostgreSQL connection. Plaintext rejected."
-            )
+        self._last_backend_ssl_active = bool(ssl_active) if isinstance(ssl_active, bool) else None
 
     async def verify_baseline_privileges(self, conn: Any) -> bool:
         """Phase A: Pre-provisioning verification. Checks existing role and PUBLIC baseline."""
@@ -2811,6 +2808,7 @@ class StagingRoleProvisioner:
             "database_verified": db_verified,
             "public_baseline_temporary": self._last_public_can_temp_db,
             "effective_application_temporary": effective_temp_str,
+            "backend_ssl_active": self._last_backend_ssl_active,
             "target": {
                 "project_id": PROJECT_ID,
                 "branch_id": STAGING_BRANCH_ID,
@@ -3343,6 +3341,13 @@ def cli_entrypoint(
             print(f"    DB Check: {db_check_str}")
             print(f"    PUBLIC Baseline TEMPORARY:     {res['public_baseline_temporary']}")
             print(f"    App Effective TEMPORARY:       {res['effective_application_temporary']}")
+            if res.get("backend_ssl_active") is not None:
+                backend_ssl_label = (
+                    "True"
+                    if res["backend_ssl_active"]
+                    else "False (Neon proxy TLS termination active)"
+                )
+                print(f"    Backend pg_stat_ssl:           {backend_ssl_label}")
             print(f"    Status:   {res['status']}")
             if not res["database_verified"]:
                 msg = (

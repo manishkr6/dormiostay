@@ -3,14 +3,14 @@
 **Target Role:** `dormiostay_app`  
 **Target Environment:** Neon Staging Branch (`br-weathered-dust-bim5fibs`)  
 **Target Project:** `small-dew-81510029` (`DormioStay`, AWS Singapore `ap-southeast-1`)  
-**Security Status:** GATE 1 INDEPENDENTLY APPROVED BY ASTRA — 245 OFFLINE TESTS PASSING (318 API TESTS TOTAL) — READY FOR USER GIT AUTHORIZATION & GATE 2 PREFLIGHT  
+**Security Status:** GATE 1 INDEPENDENTLY APPROVED BY ASTRA (BASELINE IMPLEMENTATION) — TLS PROXY CORRECTION IMPLEMENTED WITH 252 OFFLINE TESTS PASSING (325 API TESTS TOTAL) — READY FOR FOCUSED INDEPENDENT TLS REVIEW & GATE 2 DRY-RUN  
 **Execution Authorization:** STRICTLY LOCAL TESTING & DOCUMENTATION ONLY — ZERO CLOUD MUTATIONS PERFORMED  
 
 ---
 
 ## 1. Executive Summary & Astra Blocker Remediations
 
-Following independent security audits and adversarial self-review of `apps/api/scripts/provision_neon_staging_role.py`, all identified defects have been comprehensively resolved in local code and independently validated with **245 dedicated offline unit tests** (318 tests across the full API unit suite):
+Following independent security audits and adversarial self-review of `apps/api/scripts/provision_neon_staging_role.py`, all identified defects have been comprehensively resolved in local code and independently validated with **252 dedicated offline unit tests** (325 tests across the full API unit suite):
 
 1. **Astra Fourth-SIGINT & Signal Boundary Remediations — Safe Routing & Shutdown Error Preservation:**  
    - **Dedicated Signal-Routing Runner:** Replaces standard `asyncio.run()` with `_run_with_bounded_sigint_handling[T](coro)` across all CLI modes (`--dry-run`, `--contain-role`, and `--execute`).
@@ -124,6 +124,14 @@ The script adapts this mechanism: creates `NOLOGIN` with a temporary token, invo
 * **Live Catalog State Boundary & Preflight Verification:** Verified during authorized read-only preflight: `pg_database.datacl` on staging `neondb` contains `=Tc/neondb_owner`, and `has_database_privilege('public', 'neondb', 'TEMPORARY')` returned `true`.
 * **CTEs & Memory:** Ordinary Common Table Expressions (CTEs / `WITH` queries) and `ORDER BY` query sorting do **not** use the database `TEMPORARY` privilege; they operate in memory (`work_mem`) and disk work files (`temp_tablespaces`), requiring zero database privileges.
 * **Decision Status:** ACCEPTED BY PROJECT OWNER FOR STAGING ONLY, SUBJECT TO LIVE VERIFICATION (verified active during Phase 2 preflight). Direct TEMPORARY grants are forbidden. Modifying or revoking PUBLIC database privileges requires separate approval. This decision applies strictly to staging and does NOT authorize production operations or Gate 2 execution.
+
+### 3.5 Neon Proxy TLS Architecture Correction & Client Transport Verification
+* **Prior Dry-Run Failure Analysis:** The initial live staging dry-run aborted with `TargetVerificationError: TLS is not active on established connection. Insecure connection terminated.` because the script unconditionally asserted that PostgreSQL view `pg_stat_ssl WHERE pid = pg_backend_pid()` must return `ssl = true`.
+* **Client-to-Proxy vs. Backend TLS Distinction:** In Neon's managed cloud architecture, external client connections terminate TLS at the Neon edge proxy (`pg_gateway`), which enforces strict TLS and decrypts traffic before routing to the backend PostgreSQL daemon inside the isolated compute container over an internal pod channel. Consequently, PostgreSQL's internal `pg_stat_ssl` catalog view for the backend PID reports `ssl = false`. Treating this internal backend hop as proof that the client-facing WAN connection lacks encryption was an architectural misattribution.
+* **Cryptographic Guarantees Preserved:** Client-side connections continue to enforce a verified Python `SSLContext` with `check_hostname = True`, `verify_mode = ssl.CERT_REQUIRED`, trusted public CA validation, and SNI matching `EXPECTED_ENDPOINT_HOST` (`ep-cold-smoke-bir1s74t.c-5.ap-southeast-1.aws.neon.tech`). Python's OpenSSL layer cryptographically fails closed on untrusted certificates, expired certificates, or hostname mismatches. `_verify_client_tls(conn)` enforces that the active client transport is an authenticated TLS session.
+* **What `pg_stat_ssl` Does and Does Not Establish:** `pg_stat_ssl` establishes the encryption status of the internal hop between the Neon proxy and the database engine. It does *not* establish whether the client-facing connection over the internet is encrypted. In the corrected implementation, `pg_stat_ssl` is queried and recorded as non-secret diagnostic telemetry (`backend_ssl_active`), without treating `ssl = false` as a fatal error for verified proxy connections.
+* **Gate 1 Scope Boundary:** Gate 1 was independently approved by Codex Astra for the baseline implementation. The subsequent TLS proxy correction is an operational refinement pending focused independent review before any live mutation.
+* **Staging-Only Risk Acceptances A and B:** Maintained as documented (Risk A: Bootstrap password logging accepted for staging only under documented safeguards; Risk B: Inherited PUBLIC TEMPORARY accepted for staging only, live verified on staging).
 
 ---
 
