@@ -148,22 +148,53 @@ python apps/api/scripts/provision_neon_staging_role.py \
 
 1. **Gate 1 — Technical Security Review:** APPROVED by Codex Astra (independent audit). Local implementation, 245-test offline suite, Keychain adapter, privilege assertions, and CLI signal runner verified.
 2. **Gate 2 — Staging Role Provisioning Execution:** COMPLETED & VERIFIED. Restricted role `dormiostay_app` created, least privilege asserted, password reset via Neon API, stored in macOS Keychain, and promoted with verified authentication over TLS.
-3. **Gate 3 — Staging Schema Migration Execution (LOCAL IMPLEMENTATION READY; EXECUTION PENDING SEPARATE USER AUTHORIZATION):**
-   - **Approved Implementation:** `apps/api/app/db/migration_guard.py` permits strictly confirmed remote staging upgrades while enforcing fail-closed security.
-   - **Target Invariants:** Project `small-dew-81510029`, Branch `br-weathered-dust-bim5fibs`, DB `neondb`, Endpoint `ep-cold-smoke-bir1s74t.c-5.ap-southeast-1.aws.neon.tech`, Admin `neondb_owner`.
-   - **Authoritative In-Engine Verification:** Queries `neon.project_id`, `neon.branch_id`, and `neon.endpoint_id` directly from `pg_settings` during connection verification, preventing spoofing via DNS, `/etc/hosts`, or environment variable manipulation.
-   - **Hard Security Invariants:**
-     1. Production branch `br-holy-lake-bi0hc1lu` strictly rejected at target resolution and runtime connection check.
-     2. Remote downgrades strictly rejected across all environments.
-     3. Application role `dormiostay_app` strictly forbidden from executing migrations or acquiring `CREATE` on schema `public`.
-     4. Empty schema baseline asserted: verified 0 user tables and no existing `alembic_version` prior to initial migration.
-     5. Client TLS transport verified fail-closed.
-     6. Neon control-plane client enforces authentic TLS (CERT_REQUIRED, check_hostname) and dedicated StrictNoRedirectHandler strictly rejecting all 3xx HTTP redirects, preventing bearer token leakage and acceptance of redirected metadata.
-   - **Neon Backup & Snapshot Readiness (Neon CLI 9.9.3):**
-     - Pre-migration snapshot command: `neon snapshots create --project-id small-dew-81510029 --branch br-weathered-dust-bim5fibs --name pre-gate3-migration-baseline` (or `neon branches create --project-id small-dew-81510029 --parent br-weathered-dust-bim5fibs --name staging-pre-migration-backup`).
-     - Restoration procedure: `neon snapshots restore <snapshot-id> --target-branch br-weathered-dust-bim5fibs` restores the snapshot into a new branch and outputs its restored branch ID (e.g. `br-restored-xxxx`).
-     - Finalizing procedure: `neon snapshots finalize <restored-branch-id>` (using the restored branch ID returned by the restore operation, NOT the target branch) to swap the restored branch in for the target branch and transfer computes. Alternatively, specify `--finalize` during restore to swap immediately.
-     - Recovery limitations & retention: Documented Neon Free-tier point-in-time history retention is six hours with applicable capacity limits, subject to actual project configuration (paid plans support up to 30 days). Snapshots persist until explicit expiration (`--expires-at`), consuming organization storage quota (not zero-cost).
-     - Pre-migration verification: Backup/snapshot availability, active branch quota, and project storage limits must be verified before live migrations.
-4. **Gate 4 — Staging Table Grants Execution:** Run `grant_application_role.sql` as `neondb_owner`.
+3. **Gate 3 — Staging Schema Migration Execution (COMPLETED & VERIFIED):**
+   - **Status:** EXECUTED & LIVE VERIFIED on authorized staging branch `br-weathered-dust-bim5fibs`. Applied Alembic revision `0001_foundation`, successfully provisioning all 11 application tables and `alembic_version`.
+   - **Baseline Recovery Snapshot:** Verified recovery snapshot `snap-wandering-flower-bi9ojapb` (`pre-gate3-migration-baseline`) created prior to migration.
+   - **Implementation:** `apps/api/app/db/migration_guard.py` enforcing strict preflight identity binding, authentic TLS without redirects, and fail-closed safety.
+
+4. **Gate 4 — Staging Table Grants & Privilege Hardening (LOCAL IMPLEMENTATION COMPLETE; LIVE EXECUTION PENDING SEPARATE OWNER AUTHORIZATION):**
+   - **Review & Approval Status:** Codex Astra independent security approval is **PENDING** (usage quota temporarily exhausted). Rigorous local security self-review returned **PROVISIONAL PASS**. Live execution remains strictly gated pending separate project owner authorization and Astra independent review.
+   - **Policy Decision — T-05 Zero-Table-Grant Model:**
+     - The current backend service exposes only system health, readiness, and documentation endpoints (`/health/live`, `/health/ready`, `/docs`). No application routes currently perform application-table queries.
+     - In adherence to strict least privilege and Codex Astra's findings, `dormiostay_app` is granted **ZERO** table privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`) across all 11 foundation application tables:
+       1. `amenities`
+       2. `locations`
+       3. `platform_settings`
+       4. `property_categories`
+       5. `institutions`
+       6. `users`
+       7. `user_profiles`
+       8. `user_sessions`
+       9. `email_verification_tokens`
+       10. `password_reset_tokens`
+       11. `audit_logs`
+     - Additionally, `alembic_version` is governed under the exact same zero-grant policy but counted separately as an infrastructure table (total 12 governed tables). Nonexistent tables (including `user_identities`, `password_credentials`, and `outbox_events`) are not part of the foundation schema inventory.
+     - **Audit-Log Protection:** Both table-level and column-level `SELECT` and `INSERT` on `audit_logs` (including `audit_logs.action`) are strictly denied to `dormiostay_app`. In PostgreSQL, table-level privilege checks precede RLS policy evaluation, ensuring callers cannot read audit data even by manipulating session settings (`SET app.role = 'admin'`). Write privileges on `audit_logs` are deferred until trusted, server-side identity attribution is established.
+     - **Deferred Grants:** Application read and write privileges on domain tables (`users`, `user_sessions`, etc.) are deferred to future tasks (T-06+) when authentication and user management routes are implemented and independently reviewed.
+     - **Preserved Privileges:** Only independently justified schema-level `USAGE` on schema `public` and database-level `CONNECT` on database `neondb` are granted to `dormiostay_app`.
+   - **Execution Architecture — Single Supported Staging Driver:**
+     - The primary, authoritative staging execution mechanism is the guarded asynchronous Python runner (`apps/api/scripts/execute_gate4_grants.py` backed by `apps/api/app/db/grant_guard.py:execute_gate4_grants_async()`).
+     - **Single Transaction Ownership:** Begins exactly ONE transaction via `async with connection.begin():` before any SQL query executes. Preflight identity verification (`verify_grant_connection`), explicit search_path setup (`SET search_path = public`), targeted revocations (`REVOKE ALL PRIVILEGES ON TABLE public."<tbl>" FROM "dormiostay_app"`), justified schema usage grant (`GRANT USAGE ON SCHEMA public TO "dormiostay_app"`), and comprehensive catalog verification (`verify_catalog_privileges`) all execute inside that single transaction.
+     - **Automatic Rollback on Exception:** If any preflight assertion, mutation, or catalog check fails, an exception is raised, exiting the `begin()` context and automatically rolling back all changes. Success commits only after every assertion passes.
+     - **Preflight & Control-Plane Binding:** Connects over verified TLS (`sslmode=verify-full`, `check_hostname`), verifies the Neon control-plane API (project `small-dew-81510029`, branch `br-weathered-dust-bim5fibs`, endpoint `ep-cold-smoke-bir1s74t`), queries `pg_settings` for authoritative `neon.branch_id`, `neon.project_id`, and `neon.endpoint_id`, and fails closed if metadata is missing or if connected to the protected production branch (`br-holy-lake-bi0hc1lu`).
+     - **Complete Catalog Checks:**
+       1. Table privileges: 0 privileges across all 12 tables for `dormiostay_app` and `PUBLIC`.
+       2. Effective column privileges: `has_any_column_privilege` returns `False` for `SELECT`, `INSERT`, `UPDATE`, `REFERENCES` on all 12 tables for `dormiostay_app` and `PUBLIC`.
+       3. Specific column check: `has_column_privilege('dormiostay_app', 'public.audit_logs', 'action', 'SELECT')` returns `False`.
+       4. Raw ACL catalogs: inspects `pg_attribute.attacl` (columns) and `pg_class.relacl` (tables) for leaks or grant options.
+       5. GRANT OPTION: 0 table or column grant options for `dormiostay_app` or `PUBLIC`.
+       6. Default ACLs: `pg_default_acl` clean with zero grants to `dormiostay_app` or `PUBLIC`.
+       7. Non-system schemas: inventories non-system schemas, asserts 0 `CREATE` privileges, and restricts `USAGE` exclusively to `public`.
+       8. SECURITY DEFINER routines: queries `pg_proc` across non-system schemas; enforces reviewed allowlist (empty set for foundation schema) and verifies zero callable `EXECUTE` privileges for `dormiostay_app` or `PUBLIC`.
+       9. Object ownership: asserts `dormiostay_app` owns 0 relations (`pg_class`), 0 schemas (`pg_namespace`), 0 routines (`pg_proc`), and 0 types (`pg_type`).
+       10. Role memberships: `pg_auth_members` asserts 0 direct or indirect memberships.
+   - **Standalone Execution Removal:**
+     - The standalone command builder `build_safe_psql_command` has been removed.
+     - `apps/api/scripts/grant_application_role.sql` is rendered non-executable with an immediate `RAISE EXCEPTION` to prevent accidental copy-paste or manual execution that could bypass authenticated staging guardrails.
+   - **Testing & Integration Limitations:**
+     - 25 comprehensive unit tests in `apps/api/tests/unit/test_gate4_grant_guard.py` cover all findings, positive and adversarial paths, and real SQLAlchemy transaction lifecycle behavior.
+     - Real SQLAlchemy transaction behavior: reproduces Astra's `InvalidRequestError` when queries execute before `begin()`, and verifies single-transaction execution and automatic rollback.
+     - Integration testing limitation: Disposable ephemeral PostgreSQL containers/instances were unavailable in the offline development sandbox; validation relies on rigorous stateful mock unit tests and offline catalog assertion modeling.
+   - **Execution Gate:** No live SQL changes or role privilege modifications may be executed without explicit, separate owner authorization.
 5. **Gate 5 — Backend Render Service Deployment:** Bind pooled `DATABASE_URL` to Render `dormiostay-api` service and smoke test.
