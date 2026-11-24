@@ -43,6 +43,15 @@ coverage/
 playwright-report/
 test-results/
 
+# Provisioning checkpoints, locks and temp files
+.*checkpoint.json*
+.neon_staging_provisioning_checkpoint.json*
+.tmp.*
+
+# Local agent artifacts
+.agents/
+skills-lock.json
+
 # Local machine and editor files.
 .DS_Store
 .idea/
