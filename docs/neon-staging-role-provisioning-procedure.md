@@ -70,7 +70,7 @@ Following independent security audits and adversarial self-review of `apps/api/s
      - PUBLIC=True, App=False: `"False (Effective privilege denied; PENDING HUMAN ACCEPTANCE)"`.
    - Strict boolean typing: Non-boolean types raise `PrivilegeVerificationError`.
    - Consistent evidence logging: Applied across dry-run reports, Step 5 pre-reset checks, Step 13 post-reset checks, and checkpoint details.
-   - Human gates maintained: Bootstrap password DDL logging and inherited TEMPORARY privileges remain designated as **PENDING HUMAN ACCEPTANCE** (Gate 2).
+   - Risk decisions recorded: Bootstrap password DDL logging (Decision A) and inherited TEMPORARY privileges (Decision B) have been accepted by the project owner for STAGING ONLY (with live TEMPORARY verification confirmed in Phase 2 preflight). Gate 2 role provisioning execution remains pending separate user authorization.
 
 ---
 
@@ -105,23 +105,25 @@ As documented in `@neon/sdk/dist/neon/resources/role-access.js:31`:
 
 The script adapts this mechanism: creates `NOLOGIN` with a temporary token, invokes Neon's control plane reset API, and enables `LOGIN` only after verification.
 
-### 3.3 Bootstrap Password Logging Risk (PENDING HUMAN ACCEPTANCE)
+### 3.3 Bootstrap Password Logging Risk (Decision A: ACCEPTED FOR STAGING ONLY)
 * **Risk Disclosure:** Executing `CREATE ROLE dormiostay_app NOLOGIN PASSWORD '...'` causes the statement text to enter PostgreSQL query logs (`log_statement = 'ddl'` or `log_statement = 'all'`).
 * **Immutability of Provider Logs:** Neon API password reset updates `pg_authid` and proxy caches, but **cannot erase provider-side historical log lines**.
-* **Mitigating Controls:**
+* **Mitigating Safeguards:**
   1. Role is created with `NOLOGIN`. Even if logs are inspected in real time, no session can be authenticated.
   2. Single-use 256-bit CSPRNG entropy token (`secrets.token_urlsafe(32)`), discarded from memory.
   3. Neon API replaces the password before `LOGIN` is ever enabled.
   4. `LOGIN` is enabled strictly post-reset. No session could ever authenticate using the bootstrap token.
-* **Status:** PENDING HUMAN ACCEPTANCE (Gate 2).
+  5. Zero secret disclosure in logs or reports.
+  6. Fail-closed execution and automated emergency containment.
+* **Decision Status:** ACCEPTED BY PROJECT OWNER FOR STAGING ONLY under the documented safeguards. This decision applies strictly to staging and does NOT authorize production operations or Gate 2 execution.
 
-### 3.4 PostgreSQL `TEMPORARY` Privilege Clarification (PENDING HUMAN ACCEPTANCE)
+### 3.4 PostgreSQL `TEMPORARY` Privilege Clarification (Decision B: ACCEPTED FOR STAGING ONLY)
 * **Direct Database Grant:** The automation explicitly executes `REVOKE ALL ON DATABASE neondb FROM dormiostay_app;` followed solely by `GRANT CONNECT ON DATABASE neondb TO dormiostay_app;`. It grants **zero direct `TEMPORARY` privileges** to `dormiostay_app`.
 * **PUBLIC Baseline Privilege:** PostgreSQL standard default database privileges grant `TEMPORARY` (`TEMP`) to the pseudo-role `PUBLIC` (`=Tc/...`).
 * **Effective Application-Role Capability:** Because all PostgreSQL roles inherit privileges granted to `PUBLIC`, `has_database_privilege('dormiostay_app', 'neondb', 'TEMPORARY')` evaluates to `True` whenever `PUBLIC` holds `TEMPORARY`.
-* **Live Catalog State Boundary:** Offline tests verify the SQL grant statements and attribution logic using mock objects; the **live Neon `pg_database.datacl` state has NOT been queried** and will only be established during authorized Gate 2 execution.
+* **Live Catalog State Boundary & Preflight Verification:** Verified during authorized read-only preflight: `pg_database.datacl` on staging `neondb` contains `=Tc/neondb_owner`, and `has_database_privilege('public', 'neondb', 'TEMPORARY')` returned `true`.
 * **CTEs & Memory:** Ordinary Common Table Expressions (CTEs / `WITH` queries) and `ORDER BY` query sorting do **not** use the database `TEMPORARY` privilege; they operate in memory (`work_mem`) and disk work files (`temp_tablespaces`), requiring zero database privileges.
-* **Decision Status:** PENDING HUMAN ACCEPTANCE (Gate 2).
+* **Decision Status:** ACCEPTED BY PROJECT OWNER FOR STAGING ONLY, SUBJECT TO LIVE VERIFICATION (verified active during Phase 2 preflight). Direct TEMPORARY grants are forbidden. Modifying or revoking PUBLIC database privileges requires separate approval. This decision applies strictly to staging and does NOT authorize production operations or Gate 2 execution.
 
 ---
 

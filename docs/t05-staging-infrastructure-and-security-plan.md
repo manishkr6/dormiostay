@@ -67,18 +67,24 @@ Location: `apps/api/scripts/provision_neon_staging_role.py`
    - **Strict Operation Invariant:** `_assert_valid_keychain()` is asserted as the entry point of all methods (`entry_exists()`, `get_password()`, `store_password()`, `verify_stored_password()`, `_check_ambiguous_matches()`). If `self.keychain` is None or NULL, operations fail closed immediately before invoking any native Security.framework functions.
    - **Deterministic Native Reference Release:** The adapter tracks reference ownership (`self.owns_keychain = True` when acquired via default copy). `close()` and `__del__()` invoke `CFRelease(self.keychain)` if and only if `self.owns_keychain is True`, preventing handle leakage and memory corruption. `SecretStore.close()` cleanly delegates to `self.adapter.close()`.
 
-### 2.2 PostgreSQL `TEMPORARY` Privilege Clarification (PENDING HUMAN ACCEPTANCE)
+### 2.2 PostgreSQL `TEMPORARY` Privilege Clarification (Decision B: ACCEPTED FOR STAGING ONLY)
 * **Direct Database Grant:** The automation explicitly executes `REVOKE ALL ON DATABASE neondb FROM dormiostay_app;` followed solely by `GRANT CONNECT ON DATABASE neondb TO dormiostay_app;`. It grants **zero direct `TEMPORARY` privileges** to `dormiostay_app`.
 * **PUBLIC Baseline Privilege:** PostgreSQL standard default database privileges grant `TEMPORARY` (`TEMP`) to the pseudo-role `PUBLIC` (`=Tc/...`).
 * **Effective Application-Role Capability:** Because all PostgreSQL roles inherit privileges granted to `PUBLIC`, `has_database_privilege('dormiostay_app', 'neondb', 'TEMPORARY')` evaluates to `True` whenever `PUBLIC` holds `TEMPORARY`.
-* **Live Catalog State Boundary:** Offline tests verify the SQL grant statements and attribution logic using mock objects; the **live Neon `pg_database.datacl` state has NOT been queried** and will only be established during authorized Gate 2 execution.
+* **Live Catalog State Boundary & Preflight Verification:** Verified during authorized read-only preflight: `pg_database.datacl` on staging `neondb` contains `=Tc/neondb_owner`, and `has_database_privilege('public', 'neondb', 'TEMPORARY')` returned `true`.
 * **CTEs & Memory:** Ordinary Common Table Expressions (CTEs / `WITH` queries) and `ORDER BY` query sorting do **not** use the database `TEMPORARY` privilege; they operate in memory (`work_mem`) and disk work files (`temp_tablespaces`), requiring zero database privileges.
-* **Decision Status:** PENDING HUMAN ACCEPTANCE (Gate 2).
+* **Decision Status:** ACCEPTED BY PROJECT OWNER FOR STAGING ONLY, SUBJECT TO LIVE VERIFICATION (verified active during Phase 2 preflight). Direct TEMPORARY grants are forbidden. Modifying or revoking PUBLIC database privileges requires separate approval. This decision applies strictly to staging and does NOT authorize production operations or Gate 2 execution.
 
-### 2.3 Bootstrap Password Log Risk (Accepted-Risk Candidate)
-* Creating the role with a temporary password records the DDL in PostgreSQL query logs.
-* Neon API reset overwrites `pg_authid`, but cannot erase historical logs.
-* Mitigated by `NOLOGIN` state, 256-bit single-use CSPRNG entropy, and immediate API reset before `LOGIN` is ever enabled. Pending human security approval (Gate 2).
+### 2.3 Bootstrap Password Log Risk (Decision A: ACCEPTED FOR STAGING ONLY)
+* **Risk Disclosure:** Creating the role with a temporary bootstrap password records the DDL statement in PostgreSQL query logs.
+* **Immutability of Provider Logs:** Neon API reset overwrites `pg_authid` and proxy caches, but cannot erase provider-side historical log lines.
+* **Mitigating Safeguards:**
+  1. Initial `NOLOGIN` role state ensures no session can authenticate even if logs are read.
+  2. Single-use 256-bit CSPRNG entropy token, discarded from memory and never reused.
+  3. Control plane password reset executes before `LOGIN` is ever enabled.
+  4. Zero secret disclosure in logs or reports (enforced by `SecretRedactor`).
+  5. Fail-closed execution and automated emergency containment (`ALTER ROLE dormiostay_app NOLOGIN`).
+* **Decision Status:** ACCEPTED BY PROJECT OWNER FOR STAGING ONLY under the documented safeguards. This decision applies strictly to staging and does NOT authorize production operations or Gate 2 execution.
 
 ---
 
@@ -118,7 +124,7 @@ python apps/api/scripts/provision_neon_staging_role.py \
 ## 5. Human Approval Gates
 
 1. **Gate 1 — Technical Security Review:** APPROVED by Codex Astra (independent audit). Local implementation, 245-test offline suite, Keychain adapter, privilege assertions, and CLI signal runner verified.
-2. **Gate 2 — Staging Role Provisioning Execution (PENDING USER DECISIONS A & B):** Execute `provision_neon_staging_role.py` on staging after explicit user authorization.
+2. **Gate 2 — Staging Role Provisioning Execution (RISK DECISIONS A & B ACCEPTED FOR STAGING; EXECUTION PENDING SEPARATE USER AUTHORIZATION):** Execute `provision_neon_staging_role.py` on staging after explicit, separate user authorization.
 3. **Gate 3 — Staging Schema Migration Execution:** Unblock staging in `migration_guard.py` and run `alembic upgrade head` as `neondb_owner`.
 4. **Gate 4 — Staging Table Grants Execution:** Run `grant_application_role.sql` as `neondb_owner`.
 5. **Gate 5 — Backend Render Service Deployment:** Bind pooled `DATABASE_URL` to Render `dormiostay-api` service and smoke test.
