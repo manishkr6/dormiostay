@@ -111,6 +111,7 @@ def _make_mock_connection(
     owned_schemas: int = 0,
     owned_procs: int = 0,
     owned_types: int = 0,
+    relations: list[Any] | None = None,
     branch_id: str = APPROVED_STAGING_BRANCH_ID,
     project_id: str = APPROVED_STAGING_PROJECT_ID,
     endpoint_id: str = APPROVED_STAGING_ENDPOINT_ID,
@@ -128,6 +129,10 @@ def _make_mock_connection(
     app_col_map = app_col_privs or {}
     pub_col_map = public_col_privs or {}
     schemas_list = non_sys_schemas if non_sys_schemas is not None else ["public"]
+    default_relations = [
+        ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE) for t in ALL_GOVERNED_TABLES
+    ]
+    rel_rows = relations if relations is not None else default_relations
 
     async def mock_scalar(statement: Any, params: Any = None) -> Any:
         stmt = str(statement)
@@ -234,6 +239,11 @@ def _make_mock_connection(
             res.first.return_value = (True, False, False, False, False, False)
             return res
 
+        # Relation inventory
+        if "FROM pg_class c" in stmt and "c.relkind = ANY" in stmt:
+            res.fetchall.return_value = rel_rows
+            return res
+
         # Raw column ACLs
         if "FROM pg_attribute a" in stmt:
             res.fetchall.return_value = raw_col_acls if raw_col_acls is not None else empty_rows
@@ -255,12 +265,12 @@ def _make_mock_connection(
             return res
 
         # Non-system schemas inventory
-        if "FROM pg_namespace" in stmt and "nspname NOT LIKE" in stmt:
+        if "FROM pg_namespace" in stmt and "left(nspname, 3)" in stmt:
             res.fetchall.return_value = [(s,) for s in schemas_list]
             return res
 
-        # SECURITY DEFINER functions
-        if "prosecdef = true" in stmt:
+        # SECURITY DEFINER functions & non-system schema routines
+        if "FROM pg_proc p" in stmt:
             res.fetchall.return_value = secdefs if secdefs is not None else empty_rows
             return res
 
@@ -319,12 +329,17 @@ def test_zero_grant_policy_constants_and_foundation_inventory() -> None:
 
 
 # =====================================================================
-# 2. Fix 1 — Real SQLAlchemy Transaction Lifecycle & Autobegin Guard
+# 2. Single-Transaction Boundary & Simulated AsyncConnection Lifecycle (Simulated Unit Mocks)
 # =====================================================================
 
 
 class StatefulTransactionConnection:
-    """Simulates real SQLAlchemy Connection autobegin and transaction state transitions."""
+    """Simulated async connection mock modeling autobegin and transaction state transitions.
+
+    Note: This is a stateful unit mock for testing execute_gate4_grants_async control flow,
+    NOT a live PostgreSQL integration test. Genuine SQLAlchemy 2.0 transaction machinery is
+    tested separately in test_genuine_sqlalchemy_transaction_machinery_offline.
+    """
 
     def __init__(self) -> None:
         self._in_transaction = False
@@ -379,6 +394,51 @@ class StatefulTransactionConnection:
 
         tx.__aexit__ = AsyncMock(side_effect=_aexit)
         return tx
+
+
+def test_genuine_sqlalchemy_transaction_machinery_offline() -> None:
+    """Fix 3: Verify genuine SQLAlchemy 2.0 transaction machinery offline on SQLite in-memory.
+
+    Demonstrates:
+    1. Autobegin collision: Executing a query triggers autobegin, causing subsequent begin()
+       to fail with InvalidRequestError (Astra reproduction).
+    2. Single begin() boundary: Opening transaction with begin() before any SQL succeeds.
+    3. Automatic rollback: Raising an exception inside begin() rolls back uncommitted changes.
+
+    Note: This test exercises genuine SQLAlchemy 2.0 transaction state machine machinery offline.
+    Live PostgreSQL integration tests remain explicitly unverified without disposable local DB.
+    """
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("sqlite:///:memory:")
+
+    # 1. Autobegin collision: executing a query before begin()
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+        with pytest.raises(
+            InvalidRequestError,
+            match="This connection has already initialized a SQLAlchemy Transaction",
+        ):
+            with conn.begin():
+                pass
+
+    # 2. Single begin() boundary: transaction opened before any query
+    with engine.connect() as conn:
+        with conn.begin():
+            res = conn.execute(text("SELECT 42")).scalar()
+            assert res == 42
+
+    # 3. Automatic rollback on exception
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE t (id int)"))
+        conn.commit()
+        with pytest.raises(ValueError, match="Simulated error"):
+            with conn.begin():
+                conn.execute(text("INSERT INTO t VALUES (1)"))
+                raise ValueError("Simulated error")
+
+        count = conn.execute(text("SELECT count(*) FROM t")).scalar()
+        assert count == 0
 
 
 @pytest.mark.anyio
@@ -718,3 +778,205 @@ def test_resolve_grant_target_rejects_insecure_transport_and_production() -> Non
             target_role=APPROVED_APPLICATION_ROLE,
             control_plane_transport=_mock_transport(),
         )
+
+
+# =====================================================================
+# 7. Unexpected View & Relation Governance (Fix 1)
+# =====================================================================
+
+
+@pytest.mark.anyio
+async def test_unexpected_admin_owned_view_exposing_users_rejected() -> None:
+    """Fix 1: Administrator-owned view public.users_export is rejected if accessible."""
+    unexpected_relations = [
+        ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE) for t in ALL_GOVERNED_TABLES
+    ] + [("public", "users_export", "v", APPROVED_STAGING_MIGRATION_ROLE)]
+
+    # dormiostay_app has SELECT privilege on users_export
+    app_privs = {('"public"."users_export"', "SELECT"): True}
+    conn = _make_mock_connection(
+        relations=unexpected_relations,
+        app_table_privs=app_privs,
+    )
+
+    expected_msg = (
+        "unexpected relation 'public.users_export' \\(kind 'v', owner 'neondb_owner'\\) "
+        "is accessible to dormiostay_app"
+    )
+    with pytest.raises(RuntimeError, match=expected_msg):
+        await verify_catalog_privileges(conn)
+
+
+@pytest.mark.anyio
+async def test_unexpected_admin_owned_view_accessible_via_public_rejected() -> None:
+    """Fix 1: View public.users_export accessible to PUBLIC is detected and rejected."""
+    unexpected_relations = [
+        ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE) for t in ALL_GOVERNED_TABLES
+    ] + [("public", "users_export", "v", APPROVED_STAGING_MIGRATION_ROLE)]
+
+    # PUBLIC has SELECT privilege on users_export (via explicit grant, altered default ACLs,
+    # or inheritance; PostgreSQL does not automatically grant PUBLIC SELECT on new views)
+    pub_privs = {('"public"."users_export"', "SELECT"): True}
+    conn = _make_mock_connection(
+        relations=unexpected_relations,
+        public_table_privs=pub_privs,
+    )
+
+    expected_msg = (
+        "unexpected relation 'public.users_export' \\(kind 'v', owner 'neondb_owner'\\) "
+        "is accessible to PUBLIC"
+    )
+    with pytest.raises(RuntimeError, match=expected_msg):
+        await verify_catalog_privileges(conn)
+
+
+@pytest.mark.anyio
+async def test_unexpected_materialized_view_rejected_if_accessible() -> None:
+    """Fix 1: Unexpected materialized view in public is rejected if accessible."""
+    unexpected_relations = [
+        ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE) for t in ALL_GOVERNED_TABLES
+    ] + [("public", "user_metrics_mat", "m", APPROVED_STAGING_MIGRATION_ROLE)]
+
+    conn = _make_mock_connection(
+        relations=unexpected_relations,
+        app_table_privs={('"public"."user_metrics_mat"', "SELECT"): True},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="unexpected relation 'public.user_metrics_mat' \\(kind 'm'",
+    ):
+        await verify_catalog_privileges(conn)
+
+
+@pytest.mark.anyio
+async def test_unexpected_relation_column_privilege_leakage_rejected() -> None:
+    """Fix 1: Unexpected relation leaking column-level privilege is rejected."""
+    unexpected_relations = [
+        ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE) for t in ALL_GOVERNED_TABLES
+    ] + [("public", "custom_audit_view", "v", APPROVED_STAGING_MIGRATION_ROLE)]
+
+    conn = _make_mock_connection(
+        relations=unexpected_relations,
+        app_col_privs={('"public"."custom_audit_view"', "SELECT"): True},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="unexpected relation 'public.custom_audit_view' .* leaks column privilege SELECT",
+    ):
+        await verify_catalog_privileges(conn)
+
+
+@pytest.mark.anyio
+async def test_relation_inventory_fails_closed_on_missing_governed_table() -> None:
+    """Fix 1: Relation inventory fails closed if any of the 12 governed tables is missing."""
+    incomplete_relations = [
+        ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE)
+        for t in ALL_GOVERNED_TABLES
+        if t != "audit_logs"
+    ]
+    conn = _make_mock_connection(relations=incomplete_relations)
+
+    with pytest.raises(
+        RuntimeError,
+        match="expected governed table 'public.audit_logs' missing from relation inventory",
+    ):
+        await verify_catalog_privileges(conn)
+
+
+@pytest.mark.anyio
+async def test_relation_inventory_fails_closed_on_empty_catalog() -> None:
+    """Fix 1: Relation inventory fails closed on empty catalog result."""
+    conn = _make_mock_connection(relations=[])
+
+    with pytest.raises(
+        RuntimeError,
+        match="relation inventory returned zero rows",
+    ):
+        await verify_catalog_privileges(conn)
+
+
+@pytest.mark.anyio
+async def test_relation_inventory_fails_closed_on_unexpected_relkind_for_governed_table() -> None:
+    """Fix 1: Governed table must be an ordinary table ('r'), not a view or foreign table."""
+    bad_kind_relations = [
+        ("public", t, "v" if t == "users" else "r", APPROVED_STAGING_MIGRATION_ROLE)
+        for t in ALL_GOVERNED_TABLES
+    ]
+    conn = _make_mock_connection(relations=bad_kind_relations)
+
+    with pytest.raises(
+        RuntimeError,
+        match="expected table 'public.users' has unexpected relkind 'v'",
+    ):
+        await verify_catalog_privileges(conn)
+
+
+# =====================================================================
+# 8. Literal Schema Prefix Matching & Unexpected Schema Routines (Fix 2)
+# =====================================================================
+
+
+@pytest.mark.anyio
+async def test_literal_schema_prefix_matching_includes_pgextra() -> None:
+    """Fix 2: left(nspname, 3) <> 'pg_' includes pgextra (unlike wildcard NOT LIKE 'pg_%')."""
+    conn = _make_mock_connection(
+        non_sys_schemas=["public", "pgextra"],
+    )
+
+    async def mock_scalar_with_pgextra_usage(statement: Any, params: Any = None) -> Any:
+        stmt = str(statement)
+        if "has_schema_privilege" in stmt and "'USAGE'" in stmt:
+            # Both public and pgextra report USAGE = True
+            return True
+        if "has_schema_privilege" in stmt and "'CREATE'" in stmt:
+            return False
+        if "has_database_privilege" in stmt and "'CONNECT'" in stmt:
+            return True
+        if "count(*) FROM pg_tables" in stmt:
+            return 0
+        return False
+
+    conn.scalar.side_effect = mock_scalar_with_pgextra_usage
+
+    with pytest.raises(
+        RuntimeError,
+        match="Security violation: role 'dormiostay_app' has unexpected USAGE on schema 'pgextra'",
+    ):
+        await verify_catalog_privileges(conn)
+
+
+@pytest.mark.anyio
+async def test_unexpected_schema_accessible_routine_rejected() -> None:
+    """Fix 2: Callable routine in unexpected schema pgextra is rejected."""
+    pgextra_routine = [("pgextra", "export_data", 12345, False)]
+    conn = _make_mock_connection(
+        non_sys_schemas=["public", "pgextra"],
+        secdefs=pgextra_routine,
+        app_fn_exec=True,  # dormiostay_app can execute export_data
+    )
+
+    expected_msg = (
+        "routine 'pgextra.export_data' in unexpected schema 'pgextra' "
+        "is executable by dormiostay_app"
+    )
+    with pytest.raises(RuntimeError, match=expected_msg):
+        await verify_catalog_privileges(conn)
+
+
+@pytest.mark.anyio
+async def test_unexpected_schema_routine_accessible_to_public_rejected() -> None:
+    """Fix 2: Routine in unexpected schema pgextra accessible to PUBLIC is rejected."""
+    pgextra_routine = [("pgextra", "get_status", 54321, False)]
+    conn = _make_mock_connection(
+        non_sys_schemas=["public", "pgextra"],
+        secdefs=pgextra_routine,
+        pub_fn_exec=True,  # PUBLIC can execute get_status
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="routine 'pgextra.get_status' in unexpected schema 'pgextra' is executable by PUBLIC",
+    ):
+        await verify_catalog_privileges(conn)

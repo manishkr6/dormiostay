@@ -91,6 +91,10 @@ COLUMN_PRIVILEGES: tuple[str, ...] = (
     "REFERENCES",
 )
 
+# Monitored relation kinds in pg_class: ordinary table ('r'), view ('v'),
+# materialized view ('m'), foreign table ('f'), partitioned table ('p')
+MONITORED_RELATION_KINDS: tuple[str, ...] = ("r", "v", "m", "f", "p")
+
 # Allowed SECURITY DEFINER functions in non-system schemas (empty set for foundation schema)
 ALLOWED_SECURITY_DEFINER_ROUTINES: frozenset[tuple[str, str]] = frozenset()
 
@@ -389,13 +393,120 @@ async def verify_catalog_privileges(
     - Any raw table ACL entries in pg_class.relacl granting privileges to target_role or PUBLIC.
     - Any table or column GRANT OPTION for target_role or PUBLIC.
     - Any default ACL granting privileges to target_role or PUBLIC.
+    - Any unexpected relation (table, view, matview, etc.) accessible to target_role or PUBLIC.
+    - Missing governed tables or unexpected relation kinds in schema public.
     - Any unexpected callable SECURITY DEFINER routines in non-system schemas.
+    - Any callable routines in unexpected non-system schemas (e.g. pgextra).
     - Any role membership in pg_auth_members.
     - Any object ownership (relations, schemas, functions, types).
     - Any CREATE privilege on database or schemas.
     - Missing CONNECT on database or USAGE on schema public.
     """
     results: dict[str, Any] = {"table_privileges": {}, "catalog_assertions": []}
+
+    # 0. Inventory relations across non-system schemas and assert exact foundation baseline
+    rel_inventory_res = await connection.execute(
+        text(
+            "SELECT n.nspname, c.relname, c.relkind, c.relowner::regrole::text AS owner "
+            "FROM pg_class c "
+            "JOIN pg_namespace n ON c.relnamespace = n.oid "
+            "WHERE left(n.nspname, 3) <> 'pg_' "
+            "AND n.nspname != 'information_schema' "
+            "AND c.relkind = ANY(:monitored_kinds) "
+            "ORDER BY n.nspname, c.relname"
+        ),
+        {"monitored_kinds": list(MONITORED_RELATION_KINDS)},
+    )
+    rel_rows = rel_inventory_res.fetchall()
+    if not rel_rows:
+        raise RuntimeError(
+            "Catalog integrity failure: relation inventory returned zero rows; "
+            "expected foundation tables in schema public."
+        )
+
+    # Fail closed on null or corrupted catalog data
+    for row in rel_rows:
+        if row[0] is None or row[1] is None or row[2] is None:
+            raise RuntimeError(
+                "Catalog integrity failure: relation inventory returned null schema, name, or kind"
+            )
+
+    public_rels: dict[str, str] = {str(r[1]): str(r[2]) for r in rel_rows if str(r[0]) == "public"}
+
+    # Assert all 12 governed tables exist in public with relkind == 'r' (ordinary table)
+    for expected_tbl in ALL_GOVERNED_TABLES:
+        if expected_tbl not in public_rels:
+            raise RuntimeError(
+                f"Catalog integrity failure: expected governed table 'public.{expected_tbl}' "
+                f"missing from relation inventory"
+            )
+        actual_kind = public_rels[expected_tbl]
+        if actual_kind != "r":
+            raise RuntimeError(
+                f"Catalog security violation: expected table 'public.{expected_tbl}' has "
+                f"unexpected relkind '{actual_kind}' (must be ordinary table 'r')"
+            )
+
+    # Audit unexpected relations across all non-system schemas (unexpected tables, views 'v',
+    # matviews 'm', foreign tables 'f', partitioned tables 'p').
+    # Any relation not in the approved baseline is audited for privilege leakage.
+    for row in rel_rows:
+        sch_name, rel_name, rel_kind, rel_owner = (
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+        )
+        if sch_name == "public" and rel_name in ALL_GOVERNED_TABLES and rel_kind == "r":
+            continue
+
+        # Check effective table privileges on unexpected relation for target_role and PUBLIC
+        for priv in ALL_TABLE_PRIVILEGES:
+            app_priv = await connection.scalar(
+                text("SELECT has_table_privilege(:role, :tbl, :priv)"),
+                {"role": target_role, "tbl": f'"{sch_name}"."{rel_name}"', "priv": priv},
+            )
+            if app_priv is not False:
+                raise RuntimeError(
+                    f"Catalog security violation: unexpected relation '{sch_name}.{rel_name}' "
+                    f"(kind '{rel_kind}', owner '{rel_owner}') is accessible to {target_role} "
+                    f"(privilege: {priv})"
+                )
+
+            pub_priv = await connection.scalar(
+                text("SELECT has_table_privilege('public', :tbl, :priv)"),
+                {"tbl": f'"{sch_name}"."{rel_name}"', "priv": priv},
+            )
+            if pub_priv is not False:
+                raise RuntimeError(
+                    f"Catalog security violation: unexpected relation '{sch_name}.{rel_name}' "
+                    f"(kind '{rel_kind}', owner '{rel_owner}') is accessible to PUBLIC "
+                    f"(privilege: {priv})"
+                )
+
+        # Check effective column privileges on unexpected relation for target_role and PUBLIC
+        for col_priv in COLUMN_PRIVILEGES:
+            app_col = await connection.scalar(
+                text("SELECT has_any_column_privilege(:role, :tbl, :priv)"),
+                {"role": target_role, "tbl": f'"{sch_name}"."{rel_name}"', "priv": col_priv},
+            )
+            if app_col is not False:
+                raise RuntimeError(
+                    f"Catalog security violation: unexpected relation '{sch_name}.{rel_name}' "
+                    f"(kind '{rel_kind}', owner '{rel_owner}') leaks column privilege {col_priv} "
+                    f"to {target_role}"
+                )
+
+            pub_col = await connection.scalar(
+                text("SELECT has_any_column_privilege('public', :tbl, :priv)"),
+                {"tbl": f'"{sch_name}"."{rel_name}"', "priv": col_priv},
+            )
+            if pub_col is not False:
+                raise RuntimeError(
+                    f"Catalog security violation: unexpected relation '{sch_name}.{rel_name}' "
+                    f"(kind '{rel_kind}', owner '{rel_owner}') leaks column privilege {col_priv} "
+                    f"to PUBLIC"
+                )
 
     # 1. Verify zero table privileges across all 12 tables and all 7 privilege types
     for tbl in ALL_GOVERNED_TABLES:
@@ -545,7 +656,7 @@ async def verify_catalog_privileges(
     schemas_res = await connection.execute(
         text(
             "SELECT nspname FROM pg_namespace "
-            "WHERE nspname NOT LIKE 'pg_%' AND nspname != 'information_schema'"
+            "WHERE left(nspname, 3) <> 'pg_' AND nspname != 'information_schema'"
         )
     )
     non_sys_schemas = [row[0] for row in schemas_res.fetchall()]
@@ -575,41 +686,65 @@ async def verify_catalog_privileges(
                     f"on schema '{sch_name}'"
                 )
 
-    # 9. Verify no unexpected callable SECURITY DEFINER routines across all non-system schemas
+    # 9. Verify no unexpected callable SECURITY DEFINER routines across all non-system schemas,
+    # and verify zero callable routines in unexpected non-system schemas (e.g. pgextra)
     secdef_res = await connection.execute(
         text(
-            "SELECT n.nspname, p.proname, p.oid "
+            "SELECT n.nspname, p.proname, p.oid, p.prosecdef "
             "FROM pg_proc p "
             "JOIN pg_namespace n ON p.pronamespace = n.oid "
-            "WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema' "
-            "AND p.prosecdef = true"
+            "WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname != 'information_schema' "
+            "AND (p.prosecdef = true OR n.nspname != 'public')"
         )
     )
     for row in secdef_res.fetchall():
         sch_n, fn_n, fn_oid = str(row[0]), str(row[1]), row[2]
-        if (sch_n, fn_n) not in ALLOWED_SECURITY_DEFINER_ROUTINES:
-            raise RuntimeError(
-                f"Catalog security violation: Unexpected SECURITY DEFINER routine '{sch_n}.{fn_n}' "
-                f"found outside reviewed allowlist"
+        is_secdef = bool(row[3]) if len(row) > 3 else True
+        if is_secdef:
+            if (sch_n, fn_n) not in ALLOWED_SECURITY_DEFINER_ROUTINES:
+                raise RuntimeError(
+                    f"Catalog security violation: Unexpected SECURITY DEFINER routine "
+                    f"'{sch_n}.{fn_n}' found outside reviewed allowlist"
+                )
+            app_exec = await connection.scalar(
+                text("SELECT has_function_privilege(:app_role, :oid, 'EXECUTE')"),
+                {"app_role": target_role, "oid": fn_oid},
             )
-        app_exec = await connection.scalar(
-            text("SELECT has_function_privilege(:app_role, :oid, 'EXECUTE')"),
-            {"app_role": target_role, "oid": fn_oid},
-        )
-        if app_exec is not False:
-            raise RuntimeError(
-                f"Security violation: role '{target_role}' has EXECUTE on SECURITY DEFINER "
-                f"routine '{sch_n}.{fn_n}'"
+            if app_exec is not False:
+                raise RuntimeError(
+                    f"Security violation: role '{target_role}' has EXECUTE on SECURITY DEFINER "
+                    f"routine '{sch_n}.{fn_n}'"
+                )
+            pub_exec = await connection.scalar(
+                text("SELECT has_function_privilege('public', :oid, 'EXECUTE')"),
+                {"oid": fn_oid},
             )
-        pub_exec = await connection.scalar(
-            text("SELECT has_function_privilege('public', :oid, 'EXECUTE')"),
-            {"oid": fn_oid},
-        )
-        if pub_exec is not False:
-            raise RuntimeError(
-                f"Security violation: PUBLIC has EXECUTE on SECURITY DEFINER "
-                f"routine '{sch_n}.{fn_n}'"
+            if pub_exec is not False:
+                raise RuntimeError(
+                    f"Security violation: PUBLIC has EXECUTE on SECURITY DEFINER "
+                    f"routine '{sch_n}.{fn_n}'"
+                )
+
+        if sch_n != "public":
+            # Any callable routine in an unexpected non-system schema must be rejected
+            app_exec = await connection.scalar(
+                text("SELECT has_function_privilege(:app_role, :oid, 'EXECUTE')"),
+                {"app_role": target_role, "oid": fn_oid},
             )
+            if app_exec is not False:
+                raise RuntimeError(
+                    f"Security violation: routine '{sch_n}.{fn_n}' in unexpected schema '{sch_n}' "
+                    f"is executable by {target_role}"
+                )
+            pub_exec = await connection.scalar(
+                text("SELECT has_function_privilege('public', :oid, 'EXECUTE')"),
+                {"oid": fn_oid},
+            )
+            if pub_exec is not False:
+                raise RuntimeError(
+                    f"Security violation: routine '{sch_n}.{fn_n}' in unexpected schema '{sch_n}' "
+                    f"is executable by PUBLIC"
+                )
 
     # 10. Verify database privileges
     can_connect = await connection.scalar(
@@ -628,13 +763,18 @@ async def verify_catalog_privileges(
 
     # 11. Verify zero object ownership in catalogs
     owned_tables = await connection.scalar(
-        text("SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tableowner = :role"),
+        text(
+            "SELECT count(*) FROM pg_tables "
+            "WHERE left(schemaname, 3) <> 'pg_' AND schemaname != 'information_schema' "
+            "AND tableowner = :role"
+        ),
         {"role": target_role},
     )
     if owned_tables is None or owned_tables != 0:
-        raise RuntimeError(f"Role '{target_role}' owns {owned_tables} tables in schema public")
+        raise RuntimeError(f"Role '{target_role}' owns {owned_tables} tables in non-system schemas")
 
     results["catalog_assertions"] = [
+        "relation_inventory_verified",
         "zero_table_privileges_verified",
         "zero_public_privileges_verified",
         "zero_effective_column_privileges_verified",
@@ -643,6 +783,7 @@ async def verify_catalog_privileges(
         "default_acls_clean",
         "non_system_schemas_audited",
         "no_unexpected_security_definer_routines",
+        "unexpected_schema_routines_audited",
         "least_privilege_schema_db_verified",
         "zero_object_ownership_verified",
     ]
