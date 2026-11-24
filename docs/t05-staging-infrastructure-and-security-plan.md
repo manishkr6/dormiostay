@@ -15,7 +15,7 @@
 | **Render Access Discovery** | `render.yaml` Blueprint verified; CLI authenticated (`tea-d70j5lia214c73eb466g`) | Gate 5 Service provisioning on Render in Singapore |
 | **Staging Database Branch** | Exists in Neon (`br-weathered-dust-bim5fibs`) with persistent lifecycle | Role provisioning (`dormiostay_app`) + Migration run |
 | **Local Provisioning Automation** | Gate 1 Approved by Astra (baseline); TLS proxy correction & safe promotion recovery implemented | 273 offline tests passing (346 full API suite); strict Mypy clean; ready for Gate 2 promotion |
-| **Remote Alembic Migrations** | Strictly DISABLED by fail-closed `migration_guard.py` | Staging-only enablement pending Gate 3 review |
+| **Remote Alembic Migrations** | Staging enablement implemented in `migration_guard.py` (41 dedicated offline tests; 392 unit tests total); production & downgrades strictly blocked | Ready for independent security review & separate Gate 3 execution authorization |
 | **Render Services** | `dormiostay-web` (Static) and `dormiostay-api` (`plan: free`) configured in `render.yaml` | Service provisioning on Render in Singapore region |
 | **Web-to-API Proxy** | `/api/*` rewrite commented out / disabled | Active rewrite pending API domain ownership verification |
 | **Production Protection** | Production migrations blocked; no production secrets or data touched | Production branch `br-holy-lake-bi0hc1lu` untouched |
@@ -147,7 +147,23 @@ python apps/api/scripts/provision_neon_staging_role.py \
 ## 5. Human Approval Gates
 
 1. **Gate 1 — Technical Security Review:** APPROVED by Codex Astra (independent audit). Local implementation, 245-test offline suite, Keychain adapter, privilege assertions, and CLI signal runner verified.
-2. **Gate 2 — Staging Role Provisioning Execution (RISK DECISIONS A & B ACCEPTED FOR STAGING; EXECUTION PENDING SEPARATE USER AUTHORIZATION):** Execute `provision_neon_staging_role.py` on staging after explicit, separate user authorization.
-3. **Gate 3 — Staging Schema Migration Execution:** Unblock staging in `migration_guard.py` and run `alembic upgrade head` as `neondb_owner`.
+2. **Gate 2 — Staging Role Provisioning Execution:** COMPLETED & VERIFIED. Restricted role `dormiostay_app` created, least privilege asserted, password reset via Neon API, stored in macOS Keychain, and promoted with verified authentication over TLS.
+3. **Gate 3 — Staging Schema Migration Execution (LOCAL IMPLEMENTATION READY; EXECUTION PENDING SEPARATE USER AUTHORIZATION):**
+   - **Approved Implementation:** `apps/api/app/db/migration_guard.py` permits strictly confirmed remote staging upgrades while enforcing fail-closed security.
+   - **Target Invariants:** Project `small-dew-81510029`, Branch `br-weathered-dust-bim5fibs`, DB `neondb`, Endpoint `ep-cold-smoke-bir1s74t.c-5.ap-southeast-1.aws.neon.tech`, Admin `neondb_owner`.
+   - **Authoritative In-Engine Verification:** Queries `neon.project_id`, `neon.branch_id`, and `neon.endpoint_id` directly from `pg_settings` during connection verification, preventing spoofing via DNS, `/etc/hosts`, or environment variable manipulation.
+   - **Hard Security Invariants:**
+     1. Production branch `br-holy-lake-bi0hc1lu` strictly rejected at target resolution and runtime connection check.
+     2. Remote downgrades strictly rejected across all environments.
+     3. Application role `dormiostay_app` strictly forbidden from executing migrations or acquiring `CREATE` on schema `public`.
+     4. Empty schema baseline asserted: verified 0 user tables and no existing `alembic_version` prior to initial migration.
+     5. Client TLS transport verified fail-closed.
+     6. Neon control-plane client enforces authentic TLS (CERT_REQUIRED, check_hostname) and dedicated StrictNoRedirectHandler strictly rejecting all 3xx HTTP redirects, preventing bearer token leakage and acceptance of redirected metadata.
+   - **Neon Backup & Snapshot Readiness (Neon CLI 9.9.3):**
+     - Pre-migration snapshot command: `neon snapshots create --project-id small-dew-81510029 --branch br-weathered-dust-bim5fibs --name pre-gate3-migration-baseline` (or `neon branches create --project-id small-dew-81510029 --parent br-weathered-dust-bim5fibs --name staging-pre-migration-backup`).
+     - Restoration procedure: `neon snapshots restore <snapshot-id> --target-branch br-weathered-dust-bim5fibs` restores the snapshot into a new branch and outputs its restored branch ID (e.g. `br-restored-xxxx`).
+     - Finalizing procedure: `neon snapshots finalize <restored-branch-id>` (using the restored branch ID returned by the restore operation, NOT the target branch) to swap the restored branch in for the target branch and transfer computes. Alternatively, specify `--finalize` during restore to swap immediately.
+     - Recovery limitations & retention: Documented Neon Free-tier point-in-time history retention is six hours with applicable capacity limits, subject to actual project configuration (paid plans support up to 30 days). Snapshots persist until explicit expiration (`--expires-at`), consuming organization storage quota (not zero-cost).
+     - Pre-migration verification: Backup/snapshot availability, active branch quota, and project storage limits must be verified before live migrations.
 4. **Gate 4 — Staging Table Grants Execution:** Run `grant_application_role.sql` as `neondb_owner`.
 5. **Gate 5 — Backend Render Service Deployment:** Bind pooled `DATABASE_URL` to Render `dormiostay-api` service and smoke test.
