@@ -3345,7 +3345,7 @@ def cli_entrypoint(
                 backend_ssl_label = (
                     "True"
                     if res["backend_ssl_active"]
-                    else "False (Neon proxy TLS termination active)"
+                    else "False (backend observation; client TLS verified separately)"
                 )
                 print(f"    Backend pg_stat_ssl:           {backend_ssl_label}")
             print(f"    Status:   {res['status']}")

@@ -162,7 +162,7 @@ class MockDbConn:
         session_user: str = ADMIN_ROLE,
         current_database: str = EXPECTED_DATABASE,
         host: str = EXPECTED_ENDPOINT_HOST,
-        ssl_active: bool = True,
+        ssl_active: bool | None = True,
         role_exists: bool = False,
         pub_schema_create: bool = False,
         pub_db_create: bool = False,
@@ -182,7 +182,10 @@ class MockDbConn:
         self.current_database = current_database
         self.host = host
         self.ssl_active = ssl_active
-        self.client_ssl_active = ssl_active if client_ssl_active is None else client_ssl_active
+        if client_ssl_active is None:
+            self.client_ssl_active = bool(ssl_active) if ssl_active is not None else True
+        else:
+            self.client_ssl_active = client_ssl_active
         self.role_exists = role_exists
         self.pub_schema_create = pub_schema_create
         self.pub_db_create = pub_db_create
@@ -533,6 +536,30 @@ def test_cli_dry_run_with_admin_password_passes_exit_0(
     assert code == 0
     assert not api.reset_called
     assert len(connector.connect_calls) >= 1
+
+
+def test_cli_dry_run_reports_neutral_backend_pg_stat_ssl_diagnostic(
+    checkpoint_file: str,
+    mock_secret_store: SecretStore,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    api = MockNeonApi()
+    admin_conn = MockDbConn(role_exists=False, ssl_active=False, client_ssl_active=True)
+    connector = MockDatabaseConnector(admin_conn=admin_conn)
+    code = cli_entrypoint(
+        ["--checkpoint-file", checkpoint_file],
+        api_client=api,
+        secret_store=mock_secret_store,
+        connector=connector,
+        admin_password="test-admin-password",
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    assert (
+        "Backend pg_stat_ssl:           False (backend observation; client TLS verified separately)"
+        in captured.out
+    )
+    assert "Neon proxy TLS termination active" not in captured.out
 
 
 def test_cli_execute_without_admin_password_exits_1(
@@ -2098,11 +2125,12 @@ def test_verify_client_tls_comprehensive() -> None:
     assert _verify_client_tls(mock2) is True
 
     # 3. Connection with _transport.get_extra_info("ssl_object")
+    def _mock_get_extra_info(key: str) -> MagicMock | None:
+        return MagicMock() if key == "ssl_object" else None
+
     mock3 = MagicMock(spec=["_transport"])
     mock3._transport = MagicMock()
-    mock3._transport.get_extra_info.side_effect = (
-        lambda key: MagicMock() if key == "ssl_object" else None
-    )
+    mock3._transport.get_extra_info.side_effect = _mock_get_extra_info
     assert _verify_client_tls(mock3) is True
 
     # 4. Connection with client_ssl = False
