@@ -272,9 +272,18 @@ Gate 1 was formally approved by Codex Astra. Gate 2 (role provisioning) and Gate
      3. **Earlier Neon live read-only verification:** Live read-only baseline on 2026-11-24 verified zero table and column privileges on all 12 governed tables on staging branch `br-weathered-dust-bim5fibs` without live mutations.
      4. **New security checks not yet verified against Neon:** The new relation inventory, view auditing, and literal schema checks in `grant_guard.py` have been verified locally via unit tests, but have **NOT** yet been executed against live Neon staging.
      5. **PostgreSQL integration tests not performed:** Live PostgreSQL integration tests against a real PostgreSQL instance remain unexecuted in local offline testing due to the absence of a disposable local PostgreSQL container.
-4. **Test Suite Results:**
-   - **36/36 Gate 4 focused regression tests passed** in 0.44s.
-   - **433/433 full API unit test suite passed** in 27.49s.
+4. **Fix 4 — asyncpg PostgreSQL Internal "char" Array Codec Compatibility:**
+   - **Identified Failure:** During the final live read-only verification against Neon staging, `verify_catalog_privileges()` aborted with `asyncpg.exceptions.DataError: invalid input for query argument $1: ['r', 'v', 'm', 'f', 'p'] (invalid array element at index 0: a bytes-like object is required, not 'str')`.
+   - **Root Cause:** In PostgreSQL's system catalog, `pg_class.relkind` is stored as PostgreSQL's internal single-byte char type (`"char"`). In the query `c.relkind = ANY(:monitored_kinds)`, PostgreSQL inferred parameter `$1` as type `"char"[]`. `asyncpg`'s array encoder for `"char"[]` expects single-byte `bytes` (e.g. `b'r'`) rather than Python `str`, triggering a `DataError`.
+   - **Narrowly Scoped Correction:**
+     In `grant_guard.py:410-416`, explicitly cast `c.relkind` to `text` and cast the parameter array to `text[]`:
+     `c.relkind::text AS relkind` in SELECT, and `c.relkind::text = ANY(CAST(:monitored_kinds AS text[]))` in WHERE.
+     This forces PostgreSQL to infer parameter type as `text[]` (OID 1009), which `asyncpg`'s text array encoder encodes cleanly from Python `list[str]`.
+   - **Preserved Invariants:** Preserves the relation inventory query, relation kinds `('r', 'v', 'm', 'f', 'p')`, unexpected view/matview/foreign/partitioned table detection, table/column privilege assertions, and fail-closed integrity checks. No other queries in `grant_guard.py` compare against internal `"char"` arrays (`c.relname` is type `name`, which handles `str` arrays cleanly).
+   - **New Regression Test:** Added `test_relation_inventory_query_syntax_and_parameter_binding` asserting explicit `text`/`text[]` casting, `list[str]` parameter binding, and clean SQLAlchemy PostgreSQL dialect compilation.
+5. **Test Suite Results:**
+   - **37/37 Gate 4 focused regression tests passed** in 0.37s.
+   - **433/433 full API unit test suite passed** in 27.53s.
    - **Ruff Lint:** Clean (0 errors).
    - **Ruff Format:** Clean (35 files formatted).
    - **Strict Mypy:** Clean (0 issues in 31 source files).
@@ -282,6 +291,7 @@ Gate 1 was formally approved by Codex Astra. Gate 2 (role provisioning) and Gate
 ---
 
 ### 7.5 Part D — Independent Review & Downstream Status
+- **Gate 4 Live Staging Verification Status:** Full updated live verification remains **PENDING** (the previous read-only run encountered the asyncpg `relkind` codec issue; valid live catalog baseline observations from commit `3a87d4e2...` confirmed zero effective table and column privileges on all 12 tables).
 - **Independent Codex Astra Approval:** Explicitly **PENDING**.
-- **Live Staging Verification of New Code:** The latest source changes (Fixes 1–3) have **NOT** yet been run against Neon staging; all verifications are strictly local and offline.
+- **Live Staging Verification of New Code:** The latest source changes (Fixes 1–4) have **NOT** yet been run against Neon staging; all verifications are strictly local and offline.
 - **Gate 5 (Render Service Deployment):** **NOT STARTED** and strictly deferred pending separate user authorization. Zero cloud resources provisioned on Render. Zero migrations or live SQL executed. Recovery snapshot `snap-wandering-flower-bi9ojapb` remains preserved. Production branch `br-holy-lake-bi0hc1lu` remains protected and untouched.

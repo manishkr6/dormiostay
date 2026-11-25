@@ -194,12 +194,17 @@ python apps/api/scripts/provision_neon_staging_role.py \
          3. **Earlier Neon live read-only verification:** Live read-only baseline on 2026-11-24 verified zero table and column privileges on all 12 governed tables on staging branch `br-weathered-dust-bim5fibs` without live mutations.
          4. **New security checks not yet verified against Neon:** The new relation inventory, view auditing, and literal schema checks in `grant_guard.py` have been verified locally via unit tests, but have **NOT** yet been executed against live Neon staging.
          5. **PostgreSQL integration tests not performed:** Live PostgreSQL integration tests against a real PostgreSQL instance remain unexecuted in local offline testing due to the absence of a disposable local PostgreSQL container.
-     - **Test Suite Results:**
-       - 36 passed Gate 4 focused regression tests in 0.44s.
-       - 433 passed full API unit test suite in 27.49s.
-       - Ruff lint clean (0 errors); Ruff format clean (35 files formatted); strict Mypy clean (0 issues in 31 source files).
+      - **Fix 4 (asyncpg PostgreSQL Internal "char" Array Codec Compatibility):**
+        - Live read-only verification revealed that `c.relkind = ANY(:monitored_kinds)` triggered `asyncpg.exceptions.DataError` because PostgreSQL typed `$1` as `"char"[]`, which asyncpg expects as `bytes`, rejecting Python `str`.
+        - Narrowly resolved in `grant_guard.py` by casting `c.relkind::text = ANY(CAST(:monitored_kinds AS text[]))` and selecting `c.relkind::text AS relkind`. Forces PostgreSQL to infer `text[]` (OID 1009), which asyncpg encodes cleanly from `list[str]`.
+        - Added regression test `test_relation_inventory_query_syntax_and_parameter_binding` verifying explicit text casting, string array parameters, and clean PostgreSQL dialect compilation.
+      - **Test Suite Results:**
+        - 37 passed Gate 4 focused regression tests in 0.37s.
+        - 433 passed full API unit test suite in 27.53s.
+        - Ruff lint clean (0 errors); Ruff format clean (35 files formatted); strict Mypy clean (0 issues in 31 source files).
 
    - **D. Governance & Approval Boundaries:**
+     - Gate 4 updated live staging verification remains **PENDING** (live baseline unverified under committed code due to the initial asyncpg relkind error; previous live catalog read confirmed zero table/column grants).
      - Independent Codex Astra security approval remains **PENDING**.
      - Latest code changes have not been run against live Neon staging (strictly local).
      - No live SQL mutations, pushes, or merges authorized.

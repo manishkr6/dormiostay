@@ -407,12 +407,13 @@ async def verify_catalog_privileges(
     # 0. Inventory relations across non-system schemas and assert exact foundation baseline
     rel_inventory_res = await connection.execute(
         text(
-            "SELECT n.nspname, c.relname, c.relkind, c.relowner::regrole::text AS owner "
+            "SELECT n.nspname, c.relname, c.relkind::text AS relkind, "
+            "c.relowner::regrole::text AS owner "
             "FROM pg_class c "
             "JOIN pg_namespace n ON c.relnamespace = n.oid "
             "WHERE left(n.nspname, 3) <> 'pg_' "
             "AND n.nspname != 'information_schema' "
-            "AND c.relkind = ANY(:monitored_kinds) "
+            "AND c.relkind::text = ANY(CAST(:monitored_kinds AS text[])) "
             "ORDER BY n.nspname, c.relname"
         ),
         {"monitored_kinds": list(MONITORED_RELATION_KINDS)},

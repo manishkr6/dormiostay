@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import InvalidRequestError
 
 from app.db.grant_guard import (
@@ -25,6 +26,7 @@ from app.db.grant_guard import (
     APPLICATION_TABLES,
     APPROVED_APPLICATION_ROLE,
     COLUMN_PRIVILEGES,
+    MONITORED_RELATION_KINDS,
     execute_gate4_grants_async,
     resolve_grant_target,
     verify_catalog_privileges,
@@ -240,7 +242,7 @@ def _make_mock_connection(
             return res
 
         # Relation inventory
-        if "FROM pg_class c" in stmt and "c.relkind = ANY" in stmt:
+        if "FROM pg_class c" in stmt and "c.relkind" in stmt:
             res.fetchall.return_value = rel_rows
             return res
 
@@ -980,3 +982,50 @@ async def test_unexpected_schema_routine_accessible_to_public_rejected() -> None
         match="routine 'pgextra.get_status' in unexpected schema 'pgextra' is executable by PUBLIC",
     ):
         await verify_catalog_privileges(conn)
+
+
+# =====================================================================
+# 9. asyncpg relkind Array Codec Compatibility
+# =====================================================================
+
+
+@pytest.mark.anyio
+async def test_relation_inventory_query_syntax_and_parameter_binding() -> None:
+    """Validate relkind query syntax and parameter types for asyncpg compatibility.
+
+    Ensures that:
+    1. c.relkind is cast to text (c.relkind::text) in both SELECT and WHERE.
+    2. :monitored_kinds is bound to a list of strings and cast via CAST(:monitored_kinds AS text[]).
+    3. The query compiles cleanly for PostgreSQL dialect without ambiguous colons.
+    4. Passing Python str elements avoids asyncpg internal 'char' array codec (DataError).
+    """
+    from sqlalchemy.dialects import postgresql
+
+    conn = _make_mock_connection()
+
+    await verify_catalog_privileges(conn)
+
+    # Inspect the calls made to conn.execute
+    rel_inv_calls = [
+        call
+        for call in conn.execute.call_args_list
+        if "FROM pg_class c" in str(call[0][0]) and "c.relkind" in str(call[0][0])
+    ]
+    assert len(rel_inv_calls) == 1
+    call_args = rel_inv_calls[0][0]
+    sql_stmt = str(call_args[0])
+    params = call_args[1] if len(call_args) > 1 else {}
+
+    assert "c.relkind::text AS relkind" in sql_stmt
+    assert "c.relkind::text = ANY(CAST(:monitored_kinds AS text[]))" in sql_stmt
+    assert "monitored_kinds" in params
+    assert isinstance(params["monitored_kinds"], list)
+    assert all(isinstance(k, str) for k in params["monitored_kinds"])
+    assert params["monitored_kinds"] == list(MONITORED_RELATION_KINDS)
+
+    compiled = text(sql_stmt).compile(
+        dialect=postgresql.dialect()  # type: ignore[no-untyped-call]
+    )
+    compiled_str = str(compiled)
+    assert "c.relkind::text = ANY(CAST(%(monitored_kinds)s AS text[]))" in compiled_str
+    assert "monitored_kinds" in compiled.params
