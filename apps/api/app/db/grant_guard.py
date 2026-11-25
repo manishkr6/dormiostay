@@ -91,9 +91,16 @@ COLUMN_PRIVILEGES: tuple[str, ...] = (
     "REFERENCES",
 )
 
+# Standard PostgreSQL sequence privilege types
+SEQUENCE_PRIVILEGES: tuple[str, ...] = (
+    "USAGE",
+    "SELECT",
+    "UPDATE",
+)
+
 # Monitored relation kinds in pg_class: ordinary table ('r'), view ('v'),
-# materialized view ('m'), foreign table ('f'), partitioned table ('p')
-MONITORED_RELATION_KINDS: tuple[str, ...] = ("r", "v", "m", "f", "p")
+# materialized view ('m'), foreign table ('f'), partitioned table ('p'), sequence ('S')
+MONITORED_RELATION_KINDS: tuple[str, ...] = ("r", "v", "m", "f", "p", "S")
 
 # Allowed SECURITY DEFINER functions in non-system schemas (empty set for foundation schema)
 ALLOWED_SECURITY_DEFINER_ROUTINES: frozenset[tuple[str, str]] = frozenset()
@@ -394,6 +401,7 @@ async def verify_catalog_privileges(
     - Any table or column GRANT OPTION for target_role or PUBLIC.
     - Any default ACL granting privileges to target_role or PUBLIC.
     - Any unexpected relation (table, view, matview, etc.) accessible to target_role or PUBLIC.
+    - Any sequence (relkind 'S') with effective USAGE, SELECT, or UPDATE for target_role or PUBLIC.
     - Missing governed tables or unexpected relation kinds in schema public.
     - Any unexpected callable SECURITY DEFINER routines in non-system schemas.
     - Any callable routines in unexpected non-system schemas (e.g. pgextra).
@@ -448,8 +456,8 @@ async def verify_catalog_privileges(
                 f"unexpected relkind '{actual_kind}' (must be ordinary table 'r')"
             )
 
-    # Audit unexpected relations across all non-system schemas (unexpected tables, views 'v',
-    # matviews 'm', foreign tables 'f', partitioned tables 'p').
+    # Audit unexpected relations and sequences across all non-system schemas (unexpected tables,
+    # views 'v', matviews 'm', foreign tables 'f', partitioned tables 'p', sequences 'S').
     # Any relation not in the approved baseline is audited for privilege leakage.
     for row in rel_rows:
         sch_name, rel_name, rel_kind, rel_owner = (
@@ -459,6 +467,34 @@ async def verify_catalog_privileges(
             str(row[3]),
         )
         if sch_name == "public" and rel_name in ALL_GOVERNED_TABLES and rel_kind == "r":
+            continue
+
+        if rel_kind == "S":
+            # Audit sequence privileges (USAGE, SELECT, UPDATE) for target_role and PUBLIC.
+            # Owned/identity/serial sequences may exist, so we enforce zero effective access
+            # rather than rejecting sequence existence.
+            for seq_priv in SEQUENCE_PRIVILEGES:
+                app_seq = await connection.scalar(
+                    text("SELECT has_sequence_privilege(:role, :seq, :priv)"),
+                    {"role": target_role, "seq": f'"{sch_name}"."{rel_name}"', "priv": seq_priv},
+                )
+                if app_seq is not False:
+                    raise RuntimeError(
+                        f"Catalog security violation: sequence '{sch_name}.{rel_name}' "
+                        f"(owner '{rel_owner}') is accessible to {target_role} "
+                        f"(privilege: {seq_priv})"
+                    )
+
+                pub_seq = await connection.scalar(
+                    text("SELECT has_sequence_privilege('public', :seq, :priv)"),
+                    {"seq": f'"{sch_name}"."{rel_name}"', "priv": seq_priv},
+                )
+                if pub_seq is not False:
+                    raise RuntimeError(
+                        f"Catalog security violation: sequence '{sch_name}.{rel_name}' "
+                        f"(owner '{rel_owner}') is accessible to PUBLIC "
+                        f"(privilege: {seq_priv})"
+                    )
             continue
 
         # Check effective table privileges on unexpected relation for target_role and PUBLIC
@@ -776,6 +812,7 @@ async def verify_catalog_privileges(
 
     results["catalog_assertions"] = [
         "relation_inventory_verified",
+        "zero_sequence_privileges_verified",
         "zero_table_privileges_verified",
         "zero_public_privileges_verified",
         "zero_effective_column_privileges_verified",

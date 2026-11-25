@@ -200,14 +200,20 @@ python apps/api/scripts/provision_neon_staging_role.py \
         - Live read-only verification revealed that `c.relkind = ANY(:monitored_kinds)` triggered `asyncpg.exceptions.DataError` because PostgreSQL typed `$1` as `"char"[]`, which asyncpg expects as `bytes`, rejecting Python `str`.
         - Narrowly resolved in `grant_guard.py` by casting `c.relkind::text = ANY(CAST(:monitored_kinds AS text[]))` and selecting `c.relkind::text AS relkind`. Forces PostgreSQL to infer `text[]` (OID 1009), which asyncpg encodes cleanly from `list[str]`.
         - Added regression test `test_relation_inventory_query_syntax_and_parameter_binding` verifying explicit text casting, string array parameters, and clean PostgreSQL dialect compilation.
+      - **Fix 5 (PostgreSQL Sequence `relkind = 'S'` Privilege Governance — Astra Finding):**
+        - Codex Astra identified that `MONITORED_RELATION_KINDS` excluded `'S'`, omitting administrator-owned sequences accessible by `dormiostay_app` or `PUBLIC`.
+        - Added `'S'` to `MONITORED_RELATION_KINDS = ("r", "v", "m", "f", "p", "S")` (preserving `c.relkind::text = ANY(CAST(:monitored_kinds AS text[]))`) and audited every sequence in non-system schemas using `has_sequence_privilege(:role, :seq, :priv)` across `("USAGE", "SELECT", "UPDATE")` for both `dormiostay_app` and `PUBLIC`.
+        - Distinguishes sequence existence from effective runtime access (unprivileged owned/identity/serial sequences pass cleanly; accessible or malformed responses fail closed).
+        - Added 5 regression tests covering `MONITORED_RELATION_KINDS`, `UPDATE` grant rejection, `PUBLIC` `USAGE` rejection, unprivileged owned sequence pass, and malformed return fail-closed behavior.
       - **Test Suite Results:**
-        - 37 passed Gate 4 focused regression tests in 0.37s.
-        - 434 passed full API unit test suite in 27.46s.
+        - 42 passed Gate 4 focused regression tests.
+        - 439 passed full API unit test suite.
         - Ruff lint clean (0 errors); Ruff format clean (35 files formatted); strict Mypy clean (`grant_guard.py` and `test_gate4_grant_guard.py`).
 
-   - **D. Updated Live Verification (`173f6a6`), Governance & Approval Boundaries:**
-     - **Updated Gate 4 Live Staging Verification (`2026-11-25T01:29:54Z` / `06:59:54 IST`, `task-4237`):** **PASSED** (`GATE 4 UPDATED LIVE BASELINE — VERIFIED COMPLIANT`, `gate4_live_baseline_report.json`). Complete `verify_catalog_privileges()` executed without exceptions against commit `173f6a697b5e84c86e88fd75da12c430af9a8ae4` on Neon project `small-dew-81510029`, branch `br-weathered-dust-bim5fibs`, endpoint `ep-cold-smoke-bir1s74t`, database `neondb`, role `dormiostay_app`, confirming `0` table/column privileges on all 12 tables, `0` unexpected relations/routines, `0` live mutations, and preserved snapshot `snap-wandering-flower-bi9ojapb`.
-     - **Gemini 4 Hydrogen Provisional Review:** **`PROVISIONAL PASS — READY FOR ASTRA INDEPENDENT APPROVAL`** (does not replace independent Astra certification).
+   - **D. Live Verification History, Governance & Approval Boundaries:**
+     - **Earlier Live Staging Verification (`2026-11-25T01:29:54Z` / `06:59:54 IST`, `task-4237` on commit `173f6a697b5e84c86e88fd75da12c430af9a8ae4`):** **PASSED** (`GATE 4 UPDATED LIVE BASELINE — VERIFIED COMPLIANT`, `gate4_live_baseline_report.json`) across all 12 tables, views/matviews/foreign/partitioned relations, routines, and ACLs, with snapshot `snap-wandering-flower-bi9ojapb` preserved and production `br-holy-lake-bi0hc1lu` untouched. **Note:** That earlier live run did **not** cover sequences (`relkind = 'S'`).
+     - **Updated Live Verification (with Sequence `'S'` Coverage):** Remains **PENDING** (Fix 5 is locally verified only).
+     - **Gemini 4 Hydrogen Provisional Review (prior to Fix 5):** Returned `PROVISIONAL PASS — READY FOR ASTRA INDEPENDENT APPROVAL` on `173f6a697b5e84c86e88fd75da12c430af9a8ae4` (does not replace independent Astra certification).
      - **Independent Codex Astra Approval:** Remains explicitly **PENDING**.
      - **No Live Mutations:** Zero `GRANT`, `REVOKE`, pushes, or merges authorized.
 5. **Gate 5 — Backend Render Service Deployment (NOT STARTED):**

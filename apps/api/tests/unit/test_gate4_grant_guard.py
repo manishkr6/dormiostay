@@ -95,6 +95,8 @@ def _make_mock_connection(
     public_table_privs: dict[tuple[str, str], bool] | None = None,
     app_col_privs: dict[tuple[str, str], bool] | None = None,
     public_col_privs: dict[tuple[str, str], bool] | None = None,
+    app_seq_privs: dict[tuple[str, str], Any] | None = None,
+    public_seq_privs: dict[tuple[str, str], Any] | None = None,
     audit_action_select: bool = False,
     raw_col_acls: list[Any] | None = None,
     raw_tbl_acls: list[Any] | None = None,
@@ -130,6 +132,8 @@ def _make_mock_connection(
     pub_priv_map = public_table_privs or {}
     app_col_map = app_col_privs or {}
     pub_col_map = public_col_privs or {}
+    app_seq_map = app_seq_privs or {}
+    pub_seq_map = public_seq_privs or {}
     schemas_list = non_sys_schemas if non_sys_schemas is not None else ["public"]
     default_relations = [
         ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE) for t in ALL_GOVERNED_TABLES
@@ -141,8 +145,17 @@ def _make_mock_connection(
         p = params or {}
         role = p.get("role", "") or p.get("app_role", "")
         tbl = p.get("tbl", "")
+        seq = p.get("seq", "")
         priv = p.get("priv", "")
         sch = p.get("sch", "")
+
+        # 0. has_sequence_privilege
+        if "has_sequence_privilege" in stmt:
+            if "has_sequence_privilege('public'" in stmt:
+                return pub_seq_map.get((seq, priv), False)
+            if role == APPROVED_APPLICATION_ROLE:
+                return app_seq_map.get((seq, priv), False)
+            return False
 
         # 1. has_table_privilege
         if "has_table_privilege" in stmt:
@@ -1029,3 +1042,86 @@ async def test_relation_inventory_query_syntax_and_parameter_binding() -> None:
     compiled_str = str(compiled)
     assert "c.relkind::text = ANY(CAST(%(monitored_kinds)s AS text[]))" in compiled_str
     assert "monitored_kinds" in compiled.params
+
+
+# =====================================================================
+# 10. PostgreSQL Sequence ('S') Privilege Governance
+# =====================================================================
+
+
+def test_monitored_relation_kinds_includes_sequences() -> None:
+    """Ensure MONITORED_RELATION_KINDS includes 'S' alongside tables/views/matviews/foreign/part."""
+    assert MONITORED_RELATION_KINDS == ("r", "v", "m", "f", "p", "S")
+
+
+@pytest.mark.anyio
+async def test_admin_owned_sequence_granted_update_to_app_rejected() -> None:
+    """Astra finding: Admin-owned sequence granted UPDATE to dormiostay_app is rejected."""
+    relations_with_seq = [
+        ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE) for t in ALL_GOVERNED_TABLES
+    ] + [("public", "users_id_seq", "S", APPROVED_STAGING_MIGRATION_ROLE)]
+
+    conn = _make_mock_connection(
+        relations=relations_with_seq,
+        app_seq_privs={('"public"."users_id_seq"', "UPDATE"): True},
+    )
+
+    expected_msg = (
+        "sequence 'public.users_id_seq' \\(owner 'neondb_owner'\\) "
+        "is accessible to dormiostay_app \\(privilege: UPDATE\\)"
+    )
+    with pytest.raises(RuntimeError, match=expected_msg):
+        await verify_catalog_privileges(conn)
+
+
+@pytest.mark.anyio
+async def test_sequence_granted_usage_via_public_rejected() -> None:
+    """Astra finding: Sequence granted USAGE through PUBLIC is rejected."""
+    relations_with_seq = [
+        ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE) for t in ALL_GOVERNED_TABLES
+    ] + [("public", "audit_logs_seq", "S", APPROVED_STAGING_MIGRATION_ROLE)]
+
+    conn = _make_mock_connection(
+        relations=relations_with_seq,
+        public_seq_privs={('"public"."audit_logs_seq"', "USAGE"): True},
+    )
+
+    expected_msg = (
+        "sequence 'public.audit_logs_seq' \\(owner 'neondb_owner'\\) "
+        "is accessible to PUBLIC \\(privilege: USAGE\\)"
+    )
+    with pytest.raises(RuntimeError, match=expected_msg):
+        await verify_catalog_privileges(conn)
+
+
+@pytest.mark.anyio
+async def test_unprivileged_owned_sequence_passes_without_false_failure() -> None:
+    """Owned/identity/serial sequence with zero app/PUBLIC privileges must not fail."""
+    relations_with_seq = [
+        ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE) for t in ALL_GOVERNED_TABLES
+    ] + [("public", "users_id_seq", "S", APPROVED_STAGING_MIGRATION_ROLE)]
+
+    conn = _make_mock_connection(relations=relations_with_seq)
+
+    results = await verify_catalog_privileges(conn)
+    assert "zero_sequence_privileges_verified" in results["catalog_assertions"]
+    assert len(results["table_privileges"]) == 12
+
+
+@pytest.mark.anyio
+async def test_malformed_sequence_privilege_result_fails_closed() -> None:
+    """Malformed/null return from has_sequence_privilege must fail closed."""
+    relations_with_seq = [
+        ("public", t, "r", APPROVED_STAGING_MIGRATION_ROLE) for t in ALL_GOVERNED_TABLES
+    ] + [("public", "users_id_seq", "S", APPROVED_STAGING_MIGRATION_ROLE)]
+
+    conn = _make_mock_connection(
+        relations=relations_with_seq,
+        app_seq_privs={('"public"."users_id_seq"', "SELECT"): None},
+    )
+
+    expected_msg = (
+        "sequence 'public.users_id_seq' .* is accessible to dormiostay_app \\(privilege: SELECT\\)"
+    )
+    with pytest.raises(RuntimeError, match=expected_msg):
+        await verify_catalog_privileges(conn)

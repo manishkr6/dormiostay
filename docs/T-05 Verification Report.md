@@ -282,20 +282,26 @@ Gate 1 was formally approved by Codex Astra. Gate 2 (role provisioning) and Gate
    - **Preserved Invariants:** Preserves the relation inventory query, relation kinds `('r', 'v', 'm', 'f', 'p')`, unexpected view/matview/foreign/partitioned table detection, table/column privilege assertions, and fail-closed integrity checks. No other queries in `grant_guard.py` compare against internal `"char"` arrays (`c.relname` is type `name`, which handles `str` arrays cleanly).
    - **New Regression Test:** Added `test_relation_inventory_query_syntax_and_parameter_binding` asserting explicit `text`/`text[]` casting, `list[str]` parameter binding, and clean SQLAlchemy PostgreSQL dialect compilation.
 5. **Test Suite Results:**
-   - **37/37 Gate 4 focused regression tests passed** in 0.37s.
-   - **434/434 full API unit test suite passed** in 27.46s.
+   - **42/42 Gate 4 focused regression tests passed** (includes 5 new sequence `'S'` privilege tests).
+   - **439/439 full API unit test suite passed**.
    - **Ruff Lint:** Clean (0 errors).
    - **Ruff Format:** Clean (35 files formatted).
    - **Strict Mypy:** Clean (0 issues in `grant_guard.py` and `test_gate4_grant_guard.py`).
 
+6. **Fix 5 — PostgreSQL Sequence (`relkind = 'S'`) Privilege Governance (Astra Blocker):**
+   - **Astra Finding:** Codex Astra returned `CHANGES REQUIRED — REPRODUCIBLE SECURITY BLOCKER` because `MONITORED_RELATION_KINDS` in `grant_guard.py` excluded `'S'` (sequences), creating a source-level coverage gap where an administrator-owned sequence with effective `USAGE`, `SELECT`, or `UPDATE` privileges could be accessed by `dormiostay_app` or `PUBLIC` despite zero table privileges.
+   - **Exact Local Correction:**
+     - Added `'S'` to `MONITORED_RELATION_KINDS = ("r", "v", "m", "f", "p", "S")` while preserving `c.relkind::text = ANY(CAST(:monitored_kinds AS text[]))` `asyncpg` binding.
+     - Added `SEQUENCE_PRIVILEGES = ("USAGE", "SELECT", "UPDATE")` and audited every sequence in non-system schemas via PostgreSQL's `has_sequence_privilege(:role, :seq, :priv)` for both `dormiostay_app` and `PUBLIC`.
+     - Distinguished sequence existence from effective access (owned/identity/serial sequences with zero `dormiostay_app` and `PUBLIC` privileges pass cleanly; any `True` or malformed/null response fails closed with `RuntimeError`).
+   - **New Regression Tests:** Added 5 unit tests covering `MONITORED_RELATION_KINDS` sequence inclusion, rejection of sequence `UPDATE` granted to `dormiostay_app`, rejection of sequence `USAGE` granted via `PUBLIC`, clean pass for unprivileged owned sequences, and fail-closed handling of malformed `has_sequence_privilege` returns.
+
 ---
 
 ### 7.5 Part D — Updated Live Verification Evidence (`173f6a6`), Review & Downstream Status
-- **Updated Gate 4 Live Staging Verification (`2026-11-25T01:29:54Z` / `06:59:54 IST`, `task-4237`):** **PASSED** (`GATE 4 UPDATED LIVE BASELINE — VERIFIED COMPLIANT`, recorded in `gate4_live_baseline_report.json`).
-  - **Target:** Commit `173f6a697b5e84c86e88fd75da12c430af9a8ae4` on `feature/t05-staging-infrastructure` (clean working tree); Neon project `small-dew-81510029`, staging branch `br-weathered-dust-bim5fibs`, endpoint `ep-cold-smoke-bir1s74t`, database `neondb`, admin `neondb_owner`, runtime role `dormiostay_app`.
-  - **Committed Verifier Execution:** `verify_catalog_privileges()` executed to completion without exceptions over verified TLS (`sslmode=verify-full`) inside an enforced `READ ONLY` transaction (`transaction_read_only = on`), including the corrected `c.relkind::text = ANY(CAST(:monitored_kinds AS text[]))` query via SQLAlchemy 2.0 and `asyncpg`.
-  - **Catalog Evidence:** `alembic_version = 0001_foundation`; `12` governed tables (`11` app tables + `alembic_version`, `relkind = 'r'`, owner `neondb_owner`); `0` unexpected relations (views, matviews, foreign or partitioned tables); `0` table privileges (`84` checks) and `0` column privileges (`48` checks) for `dormiostay_app` and `PUBLIC`; `0` `SECURITY DEFINER` or unexpected callable routines; `0` role memberships or owned objects; `CONNECT` on `neondb` = `True`, `USAGE` on `public` = `True`, `CREATE` = `False`; zero live `GRANT`/`REVOKE` operations executed or required.
-  - **Preserved Recovery Snapshot:** `snap-wandering-flower-bi9ojapb` (`pre-gate3-migration-baseline`, `32,047,104` bytes, created `2026-11-24T16:22:26Z`) verified active and untampered. Production branch `br-holy-lake-bi0hc1lu` untouched.
-- **Gemini 4 Hydrogen Provisional Review:** **`PROVISIONAL PASS — READY FOR ASTRA INDEPENDENT APPROVAL`** (read-only technical audit; does not replace independent Astra certification).
-- **Independent Codex Astra Approval:** Explicitly **PENDING** (quota temporarily exhausted).
-- **Gate 5 (Render Service Deployment):** **NOT STARTED** and strictly deferred pending independent Astra approval and explicit user authorization. Zero cloud resources provisioned on Render. Zero migrations or live SQL executed.
+- **Previous Live Staging Verification (`2026-11-25T01:29:54Z` / `06:59:54 IST`, `task-4237` on commit `173f6a697b5e84c86e88fd75da12c430af9a8ae4`):** **PASSED** (`GATE 4 UPDATED LIVE BASELINE — VERIFIED COMPLIANT`, recorded in `gate4_live_baseline_report.json`).
+  - **Scope Note:** That earlier live verification tested `173f6a697b5e84c86e88fd75da12c430af9a8ae4` before sequence (`relkind = 'S'`) auditing was added, so **earlier live verification did not cover sequences**. Updated full live verification covering sequences remains **PENDING**.
+  - **Preserved Live Evidence:** Neon project `small-dew-81510029`, staging branch `br-weathered-dust-bim5fibs`, endpoint `ep-cold-smoke-bir1s74t`, database `neondb`, admin `neondb_owner`, runtime role `dormiostay_app`; `verify_catalog_privileges()` completed without exceptions over verified TLS (`sslmode=verify-full`) in a `READ ONLY` transaction; `alembic_version = 0001_foundation`; `12` governed tables (`relkind = 'r'`, owner `neondb_owner`); `0` unexpected relations/routines; `0` table/column privileges for `dormiostay_app` and `PUBLIC`; `0` live mutations executed; recovery snapshot `snap-wandering-flower-bi9ojapb` (`pre-gate3-migration-baseline`, `32,047,104` bytes) preserved; production branch `br-holy-lake-bi0hc1lu` untouched.
+- **Gemini 4 Hydrogen Provisional Review (prior to Fix 5):** Returned `PROVISIONAL PASS — READY FOR ASTRA INDEPENDENT APPROVAL` on `173f6a697b5e84c86e88fd75da12c430af9a8ae4` (provisional only; does not replace independent Astra certification).
+- **Independent Codex Astra Approval:** Explicitly **PENDING** (latest Astra review flagged the sequence `'S'` coverage gap; local remediation complete and awaiting live re-verification and Astra re-audit).
+- **Gate 5 (Render Service Deployment):** **NOT STARTED** and strictly deferred pending updated live verification, independent Astra approval, and explicit user authorization. Zero cloud resources provisioned on Render. Zero migrations or live SQL executed.
