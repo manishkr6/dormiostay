@@ -2,8 +2,8 @@
 
 **Project:** DormioStay  
 **Ticket:** T-05 (Render Deployment & Environments)  
-**Approved Commit:** `3a87d4e2f6d887e58a14ecde6cb538d967177676` (`fix(staging): harden Gate 4 zero-grant security baseline`)
-**Security Status:** GATE 1 INDEPENDENTLY APPROVED BY ASTRA; GATE 2 COMPLETED & VERIFIED; GATE 3 COMPLETED & VERIFIED; GATE 4 LIVE BASELINE VERIFIED (ZERO GRANTS OBSERVED IN CATALOG; NO MUTATIONS EXECUTED; SNAPSHOT PRESERVED); THREE FINAL ASTRA FINDINGS REMEDIATED LOCALLY WITH 36 FOCUSED TESTS (433 FULL API SUITE); INDEPENDENT ASTRA APPROVAL PENDING; GATE 5 NOT STARTED
+**Verified Commit:** `173f6a697b5e84c86e88fd75da12c430af9a8ae4` (`fix(staging): correct Gate 4 asyncpg relation inventory query`)
+**Security Status:** GATE 1 INDEPENDENTLY APPROVED BY ASTRA; GATE 2 COMPLETED & VERIFIED; GATE 3 COMPLETED & VERIFIED; GATE 4 UPDATED LIVE BASELINE VERIFIED COMPLIANT (`task-4237`, ZERO GRANTS, ZERO MUTATIONS, SNAPSHOT PRESERVED); GEMINI 4 HYDROGEN PROVISIONAL PASS; INDEPENDENT ASTRA APPROVAL PENDING; GATE 5 NOT STARTED
 
 ---
 
@@ -15,8 +15,8 @@
 | **Render Access Discovery** | `render.yaml` Blueprint verified; CLI authenticated (`tea-d70j5lia214c73eb466g`) | Gate 5 Service provisioning on Render in Singapore (NOT STARTED) |
 | **Staging Database Branch** | Exists in Neon (`br-weathered-dust-bim5fibs`) with persistent lifecycle | Role provisioned (`dormiostay_app`), migration applied (`0001_foundation`), Gate 4 zero-grant security baseline verified compliant in live catalog |
 | **Recovery Snapshot** | Verified recovery snapshot `snap-wandering-flower-bi9ojapb` (`pre-gate3-migration-baseline`, 32,047,104 bytes) active and preserved | Preserved for emergency rollback |
-| **Application Role Privileges** | Gate 4 live read-only verification: ZERO effective table or column privileges across all 12 governed tables; no live mutation required or executed | Ready for Gate 5 deployment (independent Astra approval PENDING) |
-| **Local Provisioning & Guard Automation** | Gate 1 Approved by Astra (baseline); Gate 4 guard updated with relation inventory, literal schema matching, and genuine transaction tests (36 unit tests, 433 full API suite); strict Mypy clean | Independent Astra Gate 4 approval PENDING (changes not yet live-verified) |
+| **Application Role Privileges** | Gate 4 updated live read-only verification (`173f6a6`, `task-4237`): ZERO effective table/column privileges across all 12 tables; `0` unexpected relations/routines; `verify_catalog_privileges()` passed without exceptions; no live mutation required | Ready for Gate 5 deployment (Gemini 4 Hydrogen provisional pass; independent Astra approval PENDING) |
+| **Local Provisioning & Guard Automation** | Gate 1 Approved by Astra (baseline); Gate 4 guard updated with relation inventory, literal schema matching, `asyncpg` `relkind::text` cast, and genuine transaction tests (37 unit tests, 434 full API suite); strict Mypy clean | Updated live read-only verification PASSED (`task-4237`); independent Astra approval PENDING |
 | **Remote Alembic Migrations** | Staging enablement implemented in `migration_guard.py`; Gate 3 executed and verified on staging (`0001_foundation`); production strictly blocked | Completed & verified |
 | **Render Services** | `dormiostay-web` (Static) and `dormiostay-api` (`plan: free`) configured in `render.yaml` | Gate 5 Service provisioning on Render in Singapore (NOT STARTED) |
 | **Web-to-API Proxy** | `/api/*` rewrite commented out / disabled | Active rewrite pending API domain ownership verification |
@@ -155,9 +155,11 @@ python apps/api/scripts/provision_neon_staging_role.py \
    - **Baseline Recovery Snapshot:** Verified recovery snapshot `snap-wandering-flower-bi9ojapb` (`pre-gate3-migration-baseline`) created prior to migration.
    - **Implementation:** `apps/api/app/db/migration_guard.py` enforcing strict preflight identity binding, authentic TLS without redirects, and fail-closed safety.
 
-4. **Gate 4 — Staging Table Grants & Privilege Hardening (LIVE BASELINE VERIFIED; THREE ASTRA FINDINGS REMEDIATED LOCALLY; INDEPENDENT APPROVAL PENDING):**
-   - **Verification Decision:** **`GATE 4 LIVE BASELINE — VERIFIED COMPLIANT`** for observed table/column permissions on committed baseline `3a87d4e2...` (strict read-only catalog verification executed on 2026-11-24T17:54:25Z / 23:24:25 IST).
-   - **Review & Approval Status:** Codex Astra independent security approval remains explicitly **PENDING**. The latest local source changes (Fixes 1–3) have **NOT** yet been verified against live Neon staging; they are verified locally with 36 regression unit tests and strict static analysis.
+4. **Gate 4 — Staging Table Grants & Privilege Hardening (UPDATED LIVE BASELINE VERIFIED COMPLIANT; GEMINI 4 HYDROGEN PROVISIONAL PASS; INDEPENDENT ASTRA APPROVAL PENDING):**
+   - **Verification Decisions:**
+     - Historical baseline (`3a87d4e2...`, `2026-11-24T17:54:25Z`): `GATE 4 LIVE BASELINE — VERIFIED COMPLIANT`.
+     - Updated baseline (`173f6a69...`, `2026-11-25T01:29:54Z` / `06:59:54 IST`, `task-4237`): **`GATE 4 UPDATED LIVE BASELINE — VERIFIED COMPLIANT`**. Complete committed `verify_catalog_privileges()` executed without exceptions.
+   - **Review & Approval Status:** Gemini 4 Hydrogen returned `PROVISIONAL PASS — READY FOR ASTRA INDEPENDENT APPROVAL`. Independent Codex Astra security approval remains explicitly **PENDING**.
 
    - **A. Live Catalog Checks Actually Performed (Neon Staging Baseline):**
      - **Target Invariants:** Neon project `small-dew-81510029`, branch `br-weathered-dust-bim5fibs` (staging), endpoint `ep-cold-smoke-bir1s74t.c-5.ap-southeast-1.aws.neon.tech`, database `neondb`, admin `neondb_owner`, app role `dormiostay_app`.
@@ -200,14 +202,14 @@ python apps/api/scripts/provision_neon_staging_role.py \
         - Added regression test `test_relation_inventory_query_syntax_and_parameter_binding` verifying explicit text casting, string array parameters, and clean PostgreSQL dialect compilation.
       - **Test Suite Results:**
         - 37 passed Gate 4 focused regression tests in 0.37s.
-        - 433 passed full API unit test suite in 27.53s.
-        - Ruff lint clean (0 errors); Ruff format clean (35 files formatted); strict Mypy clean (0 issues in 31 source files).
+        - 434 passed full API unit test suite in 27.46s.
+        - Ruff lint clean (0 errors); Ruff format clean (35 files formatted); strict Mypy clean (`grant_guard.py` and `test_gate4_grant_guard.py`).
 
-   - **D. Governance & Approval Boundaries:**
-     - Gate 4 updated live staging verification remains **PENDING** (live baseline unverified under committed code due to the initial asyncpg relkind error; previous live catalog read confirmed zero table/column grants).
-     - Independent Codex Astra security approval remains **PENDING**.
-     - Latest code changes have not been run against live Neon staging (strictly local).
-     - No live SQL mutations, pushes, or merges authorized.
+   - **D. Updated Live Verification (`173f6a6`), Governance & Approval Boundaries:**
+     - **Updated Gate 4 Live Staging Verification (`2026-11-25T01:29:54Z` / `06:59:54 IST`, `task-4237`):** **PASSED** (`GATE 4 UPDATED LIVE BASELINE — VERIFIED COMPLIANT`, `gate4_live_baseline_report.json`). Complete `verify_catalog_privileges()` executed without exceptions against commit `173f6a697b5e84c86e88fd75da12c430af9a8ae4` on Neon project `small-dew-81510029`, branch `br-weathered-dust-bim5fibs`, endpoint `ep-cold-smoke-bir1s74t`, database `neondb`, role `dormiostay_app`, confirming `0` table/column privileges on all 12 tables, `0` unexpected relations/routines, `0` live mutations, and preserved snapshot `snap-wandering-flower-bi9ojapb`.
+     - **Gemini 4 Hydrogen Provisional Review:** **`PROVISIONAL PASS — READY FOR ASTRA INDEPENDENT APPROVAL`** (does not replace independent Astra certification).
+     - **Independent Codex Astra Approval:** Remains explicitly **PENDING**.
+     - **No Live Mutations:** Zero `GRANT`, `REVOKE`, pushes, or merges authorized.
 5. **Gate 5 — Backend Render Service Deployment (NOT STARTED):**
    - **Status:** **NOT STARTED**.
-   - Service provisioning on Render in Singapore region (`dormiostay-api` Web Service, `dormiostay-web` Static Site), environment variable binding, pooled database connection string configuration, and smoke testing remain deferred pending independent Codex Astra Gate 4 approval and explicit project owner authorization. Zero Render resources have been provisioned.
+   - Service provisioning on Render in Singapore region (`dormiostay-api` Web Service on `plan: free`, `dormiostay-web` Static Site), environment variable binding (`DATABASE_URL` pooled `dormiostay_app` URL with `?sslmode=verify-full` only, exact `FRONTEND_ORIGIN`), and smoke testing remain deferred pending independent Codex Astra Gate 4 approval and explicit project owner authorization. Zero Render resources have been provisioned.
