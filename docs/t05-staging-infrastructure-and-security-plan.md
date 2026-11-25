@@ -2,8 +2,8 @@
 
 **Project:** DormioStay  
 **Ticket:** T-05 (Render Deployment & Environments)  
-**Verified Commit:** `173f6a697b5e84c86e88fd75da12c430af9a8ae4` (`fix(staging): correct Gate 4 asyncpg relation inventory query`)
-**Security Status:** GATE 1 INDEPENDENTLY APPROVED BY ASTRA; GATE 2 COMPLETED & VERIFIED; GATE 3 COMPLETED & VERIFIED; GATE 4 UPDATED LIVE BASELINE VERIFIED COMPLIANT (`task-4237`, ZERO GRANTS, ZERO MUTATIONS, SNAPSHOT PRESERVED); GEMINI 4 HYDROGEN PROVISIONAL PASS; INDEPENDENT ASTRA APPROVAL PENDING; GATE 5 NOT STARTED
+**Verified Commit:** `0a576a3c3f5761a341eb87873b7e4e2e9569c05c` (`fix(staging): audit PostgreSQL sequence privileges in Gate 4`)
+**Security Status:** GATE 1 INDEPENDENTLY APPROVED BY ASTRA; GATE 2 COMPLETED & VERIFIED; GATE 3 COMPLETED & VERIFIED; GATE 4 SEQUENCE-AWARE LIVE BASELINE VERIFIED COMPLIANT (`task-4511`, ZERO GRANTS, ZERO MUTATIONS, SNAPSHOT PRESERVED); GEMINI 4 HYDROGEN PROVISIONAL PASS; INDEPENDENT ASTRA APPROVAL PENDING; GATE 5 NOT STARTED
 
 ---
 
@@ -15,8 +15,8 @@
 | **Render Access Discovery** | `render.yaml` Blueprint verified; CLI authenticated (`tea-d70j5lia214c73eb466g`) | Gate 5 Service provisioning on Render in Singapore (NOT STARTED) |
 | **Staging Database Branch** | Exists in Neon (`br-weathered-dust-bim5fibs`) with persistent lifecycle | Role provisioned (`dormiostay_app`), migration applied (`0001_foundation`), Gate 4 zero-grant security baseline verified compliant in live catalog |
 | **Recovery Snapshot** | Verified recovery snapshot `snap-wandering-flower-bi9ojapb` (`pre-gate3-migration-baseline`, 32,047,104 bytes) active and preserved | Preserved for emergency rollback |
-| **Application Role Privileges** | Gate 4 updated live read-only verification (`173f6a6`, `task-4237`): ZERO effective table/column privileges across all 12 tables; `0` unexpected relations/routines; `verify_catalog_privileges()` passed without exceptions; no live mutation required | Ready for Gate 5 deployment (Gemini 4 Hydrogen provisional pass; independent Astra approval PENDING) |
-| **Local Provisioning & Guard Automation** | Gate 1 Approved by Astra (baseline); Gate 4 guard updated with relation inventory, literal schema matching, `asyncpg` `relkind::text` cast, and genuine transaction tests (37 unit tests, 434 full API suite); strict Mypy clean | Updated live read-only verification PASSED (`task-4237`); independent Astra approval PENDING |
+| **Application Role Privileges** | Gate 4 sequence-aware live read-only verification (`0a576a3`, `task-4511`): ZERO effective table/column privileges across all 12 tables; `0` sequences in non-system schemas; `0` unexpected relations/routines; `verify_catalog_privileges()` passed without exceptions; no live mutation required | Ready for Gate 5 deployment (Gemini 4 Hydrogen provisional pass; independent Astra approval PENDING) |
+| **Local Provisioning & Guard Automation** | Gate 1 Approved by Astra (baseline); Gate 4 guard updated with relation inventory, sequence auditing (`'S'`), literal schema matching, `asyncpg` `relkind::text` cast, and genuine transaction tests (42 unit tests, 439 full API suite); strict Mypy clean | Sequence-aware live read-only verification PASSED (`task-4511`); independent Astra approval PENDING |
 | **Remote Alembic Migrations** | Staging enablement implemented in `migration_guard.py`; Gate 3 executed and verified on staging (`0001_foundation`); production strictly blocked | Completed & verified |
 | **Render Services** | `dormiostay-web` (Static) and `dormiostay-api` (`plan: free`) configured in `render.yaml` | Gate 5 Service provisioning on Render in Singapore (NOT STARTED) |
 | **Web-to-API Proxy** | `/api/*` rewrite commented out / disabled | Active rewrite pending API domain ownership verification |
@@ -211,10 +211,17 @@ python apps/api/scripts/provision_neon_staging_role.py \
         - Ruff lint clean (0 errors); Ruff format clean (35 files formatted); strict Mypy clean (`grant_guard.py` and `test_gate4_grant_guard.py`).
 
    - **D. Live Verification History, Governance & Approval Boundaries:**
-     - **Earlier Live Staging Verification (`2026-11-25T01:29:54Z` / `06:59:54 IST`, `task-4237` on commit `173f6a697b5e84c86e88fd75da12c430af9a8ae4`):** **PASSED** (`GATE 4 UPDATED LIVE BASELINE — VERIFIED COMPLIANT`, `gate4_live_baseline_report.json`) across all 12 tables, views/matviews/foreign/partitioned relations, routines, and ACLs, with snapshot `snap-wandering-flower-bi9ojapb` preserved and production `br-holy-lake-bi0hc1lu` untouched. **Note:** That earlier live run did **not** cover sequences (`relkind = 'S'`).
-     - **Updated Live Verification (with Sequence `'S'` Coverage):** Remains **PENDING** (Fix 5 is locally verified only).
-     - **Gemini 4 Hydrogen Provisional Review (prior to Fix 5):** Returned `PROVISIONAL PASS — READY FOR ASTRA INDEPENDENT APPROVAL` on `173f6a697b5e84c86e88fd75da12c430af9a8ae4` (does not replace independent Astra certification).
-     - **Independent Codex Astra Approval:** Remains explicitly **PENDING**.
+     - **Gate 4 Sequence-Aware Live Staging Verification (`2026-11-25T13:31:50Z` / `19:01:50 IST`, `task-4511` on commit `0a576a3c3f5761a341eb87873b7e4e2e9569c05c`):** **PASSED** (`GATE 4 SEQUENCE-AWARE LIVE BASELINE — VERIFIED COMPLIANT`, recorded in `gate4_sequence_live_baseline_report.json`).
+       - Complete committed `verify_catalog_privileges()` executed to completion without exceptions in an enforced `READ ONLY` transaction (`transaction_read_only = on`) over certificate- and hostname-verified TLS (`sslmode=verify-full`, `PGSSLROOTCERT=/etc/ssl/cert.pem`).
+       - Neon staging target independently verified: project `small-dew-81510029`, branch `br-weathered-dust-bim5fibs`, endpoint `ep-cold-smoke-bir1s74t`, host `ep-cold-smoke-bir1s74t.c-5.ap-southeast-1.aws.neon.tech`, database `neondb`, admin `neondb_owner`, application role `dormiostay_app`.
+       - All 12 governed tables (`11` application tables + `alembic_version`, `relkind = 'r'`, owner `neondb_owner`) verified at Alembic revision `0001_foundation` with strictly **zero effective application-table privileges** (all 7 privileges: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER` returning `False` for both `dormiostay_app` and `PUBLIC`) and zero column privileges (including `audit_logs.action` `SELECT`).
+       - `MONITORED_RELATION_KINDS = ("r", "v", "m", "f", "p", "S")` executed via corrected text array query. Exactly **zero sequences** (`relkind = 'S'`) were found in non-system schemas (foundation schema uses UUID primary keys across all 11 tables). **Explicit limitation:** Because zero sequences exist in the live staging database, live sequence privilege checks (`has_sequence_privilege`) were not exercised against an existing live sequence; live verification confirmed catalog inventory filtering and zero-grant assertion on 0 live sequences.
+       - Positive and negative sequence privilege grant scenarios (rejection of sequence `UPDATE` granted to `dormiostay_app`, rejection of sequence `USAGE` granted via `PUBLIC`, clean pass for unprivileged owned sequences, and fail-closed handling of malformed returns) were verified via the **5 simulated in-memory unit regression tests** in `test_gate4_grant_guard.py` (which test Python control flow and SQL branching against mock connection objects), distinct from the **live PostgreSQL catalog execution** on Neon staging.
+       - Zero raw ACL leakage, zero default ACL leakage, zero elevated role memberships, zero objects owned by `dormiostay_app`, `CONNECT` on `neondb` = `True`, `USAGE` on `public` = `True`, `CREATE` = `False`, and zero `SECURITY DEFINER` routines in non-system schemas. Total 330 security assertions evaluated with 0 violations.
+       - No live `GRANT` or `REVOKE` operations were necessary or executed; staging database is natively compliant with zero-table-grant and zero-sequence-grant policies.
+       - Recovery snapshot `snap-wandering-flower-bi9ojapb` (`pre-gate3-migration-baseline`, 32,047,104 bytes) verified active and preserved. Production branch `br-holy-lake-bi0hc1lu` untouched.
+     - **Gemini 4 Hydrogen Provisional Review:** Returned **`PROVISIONAL PASS — SEQUENCE FINDING RESOLVED`** on `0a576a3c3f5761a341eb87873b7e4e2e9569c05c` (technical audit; does not replace independent Astra certification).
+     - **Independent Codex Astra Approval:** Explicitly **PENDING** (re-review submission ready with live sequence verification evidence).
      - **No Live Mutations:** Zero `GRANT`, `REVOKE`, pushes, or merges authorized.
 5. **Gate 5 — Backend Render Service Deployment (NOT STARTED):**
    - **Status:** **NOT STARTED**.
