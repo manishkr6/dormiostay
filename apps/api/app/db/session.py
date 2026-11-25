@@ -97,11 +97,16 @@ async def transaction(
         yield session
 
 
-async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
-    """Guest by default; future authentication supplies trusted request.state identity."""
+def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
+    """Return the configured async sessionmaker factory from application state."""
     if not hasattr(request.app.state, "database_engine"):
         request.app.state.database_engine = create_engine(request.app.state.settings.database_url)
-    factory = async_sessionmaker(request.app.state.database_engine, expire_on_commit=False)
+    return async_sessionmaker(request.app.state.database_engine, expire_on_commit=False)
+
+
+async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
+    """Guest by default; future authentication supplies trusted request.state identity."""
+    factory = get_session_factory(request)
     async with transaction(
         factory, getattr(request.state, "user_id", None), getattr(request.state, "role", "guest")
     ) as session:

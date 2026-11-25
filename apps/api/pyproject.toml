@@ -12,6 +12,7 @@ dependencies = [
     "pydantic-settings==2.10.1",
     "sentry-sdk[fastapi]==2.46.0",
     "uvicorn==0.52.4",
+    "pwdlib[argon2]==0.4.2",
 ]
 
 [dependency-groups]

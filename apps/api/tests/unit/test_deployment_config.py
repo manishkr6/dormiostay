@@ -47,6 +47,7 @@ def test_requirements_file_matches_pyproject() -> None:
         "pydantic-settings",
         "sentry-sdk",
         "uvicorn",
+        "pwdlib",
     ]
     for pkg in expected_packages:
         assert pkg in req_text, f"{pkg} missing from requirements.txt"
