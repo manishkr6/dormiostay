@@ -112,6 +112,52 @@ class Settings(BaseSettings):
         description="Trusted reverse proxy IPs or CIDR blocks for X-Forwarded-For resolution",
     )
 
+    # T-09 Email Outbox & Brevo Configuration
+    brevo_api_key: str | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices("brevo_api_key", "BREVO_API_KEY"),
+        description="Server-only Brevo transactional email credential",
+    )
+    brevo_webhook_secret: str | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices("brevo_webhook_secret", "BREVO_WEBHOOK_SECRET"),
+        description="Secret token for authenticating Brevo webhooks",
+    )
+    email_from_address: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("email_from_address", "EMAIL_FROM_ADDRESS"),
+        description="Verified email sender address",
+    )
+    email_from_name: str = Field(
+        default="DormioStay",
+        validation_alias=AliasChoices("email_from_name", "EMAIL_FROM_NAME"),
+        description="Email sender display name",
+    )
+    brevo_api_url: str = Field(
+        default="https://api.brevo.com/v3/smtp/email",
+        validation_alias=AliasChoices("brevo_api_url", "BREVO_API_URL"),
+        description="Brevo transactional email API URL",
+    )
+    email_worker_batch_size: int = Field(
+        default=20,
+        gt=0,
+        le=100,
+        validation_alias=AliasChoices("email_worker_batch_size", "EMAIL_WORKER_BATCH_SIZE"),
+        description="Max emails processed per worker batch",
+    )
+    email_dev_mode: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("email_dev_mode", "EMAIL_DEV_MODE"),
+        description="Explicit email development simulation mode",
+    )
+
+    @property
+    def is_email_dev_mode(self) -> bool:
+        """Dev mode is active if explicitly enabled or if no sender/key is set."""
+        return bool(self.email_dev_mode or not (self.brevo_api_key and self.email_from_address))
+
     @field_validator("trusted_proxies", mode="before")
     @classmethod
     def parse_trusted_proxies(cls, value: Any) -> list[str]:
@@ -132,6 +178,22 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "CSRF_SECRET (csrf_secret_key) must be explicitly configured when "
                     "authentication endpoints are enabled in production or staging environments."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_email_credentials_for_production(self) -> "Settings":
+        if self.auth_endpoints_enabled and self.app_env in ("production", "staging"):
+            if not self.email_dev_mode and not (
+                self.brevo_api_key
+                and self.brevo_api_key.strip()
+                and self.email_from_address
+                and self.email_from_address.strip()
+            ):
+                raise ValueError(
+                    "BREVO_API_KEY and EMAIL_FROM_ADDRESS must be explicitly configured "
+                    "when authentication endpoints are enabled in production or staging, "
+                    "unless EMAIL_DEV_MODE is explicitly enabled."
                 )
         return self
 
