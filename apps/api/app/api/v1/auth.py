@@ -17,6 +17,11 @@ from app.core.csrf import (
     get_csrf_signing_key,
 )
 from app.core.errors import AppError
+from app.core.rate_limit import (
+    rate_limit_csrf,
+    rate_limit_login,
+    rate_limit_signup,
+)
 from app.db.models import User, UserSession
 from app.db.session import get_session, get_session_factory
 from app.schemas.auth import (
@@ -40,6 +45,7 @@ router = APIRouter(
 @router.get(
     "/csrf",
     response_model=CsrfResponse,
+    dependencies=[Depends(rate_limit_csrf)],
     summary="Obtain a CSRF token for Web state-changing requests",
 )
 async def get_csrf(
@@ -97,6 +103,7 @@ async def get_csrf(
     "/signup",
     response_model=UserResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit_signup)],
     summary="Register a new Tenant or Owner account",
 )
 async def signup(
@@ -118,6 +125,7 @@ async def signup(
 @router.post(
     "/login",
     response_model=None,
+    dependencies=[Depends(rate_limit_login)],
     summary="Authenticate and establish server-side session",
 )
 async def login(

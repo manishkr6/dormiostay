@@ -12,6 +12,7 @@ from app.api.v1.router import router as api_router
 from app.core.config import Settings, get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
+from app.core.rate_limit import close_redis_client
 from app.core.request_id import RequestIdMiddleware
 from app.core.sentry import initialise_sentry
 from app.db.session import check_runtime_database
@@ -29,6 +30,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     yield
     if hasattr(application.state, "database_engine"):
         await application.state.database_engine.dispose()
+    await close_redis_client()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

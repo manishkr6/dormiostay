@@ -1,9 +1,9 @@
 """Validated server-side configuration."""
 
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import AliasChoices, AnyHttpUrl, Field, model_validator
+from pydantic import AliasChoices, AnyHttpUrl, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AppEnvironment = Literal["development", "staging", "production"]
@@ -78,6 +78,48 @@ class Settings(BaseSettings):
         gt=0,
         description="Expiration time in seconds for CSRF tokens",
     )
+
+    # T-08 Rate Limiting & Abuse Prevention Configuration
+    rate_limit_enabled: bool = Field(
+        default=True,
+        description="Master switch for rate limiting",
+    )
+    redis_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("redis_url", "REDIS_URL"),
+        description="Redis connection URL (e.g. redis://127.0.0.1:6380/0)",
+    )
+    upstash_redis_rest_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("upstash_redis_rest_url", "UPSTASH_REDIS_REST_URL"),
+        description="Upstash Redis REST API URL (alternative to redis_url)",
+    )
+    upstash_redis_rest_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("upstash_redis_rest_token", "UPSTASH_REDIS_REST_TOKEN"),
+        repr=False,
+        description="Upstash Redis REST API token",
+    )
+    rate_limit_connect_timeout_seconds: float = Field(
+        default=1.0,
+        gt=0,
+        le=10.0,
+        description="Redis operation timeout in seconds before falling back to in-memory limits",
+    )
+    trusted_proxies: list[str] = Field(
+        default=["127.0.0.1", "::1", "testclient"],
+        validation_alias=AliasChoices("trusted_proxies", "TRUSTED_PROXIES"),
+        description="Trusted reverse proxy IPs or CIDR blocks for X-Forwarded-For resolution",
+    )
+
+    @field_validator("trusted_proxies", mode="before")
+    @classmethod
+    def parse_trusted_proxies(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        if isinstance(value, list):
+            return [str(part).strip() for part in value if str(part).strip()]
+        return ["127.0.0.1", "::1", "testclient"]
 
     @property
     def is_production(self) -> bool:
