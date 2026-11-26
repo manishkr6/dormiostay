@@ -2,6 +2,7 @@
 
 import logging
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 import httpx
 from sqlalchemy import func, select
@@ -133,10 +134,19 @@ async def process_outbox_batch(
     batch_size: int = 20,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, int]:
-    """Fetch and process a batch of queued outbox rows.
+    """Fetch and process queued outbox rows using discrete per-item transactions (T-09 AUDIT-01).
 
-    Uses `SELECT ... FOR UPDATE SKIP LOCKED` on PostgreSQL to support multi-worker concurrency
-    without duplicate processing.
+    Concurrency & Transaction Boundary Architecture:
+    - Processes at most `batch_size` items sequentially per invocation.
+    - Claims exactly ONE pending queued item per database transaction using
+      `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1`.
+    - Eliminates multi-row lock release race: each claimed item is locked, processed,
+      and committed inside its own transaction before the next item is queried.
+    - Prevents tight polling loops: maintains `attempted_ids` across the batch so that
+      items returning to 'queued' (e.g. auth errors or transient delays) are not re-selected
+      in the same batch cycle.
+    - Halts batch early on provider authentication failures (`auth_error`) to avoid
+      futile API calls.
     """
     stats: dict[str, int] = {
         "processed": 0,
@@ -151,37 +161,66 @@ async def process_outbox_batch(
         client = httpx.AsyncClient(timeout=10.0)
         own_client = True
 
+    attempted_ids: set[UUID] = set()
+
     try:
-        async with session_factory() as session:
-            # Construct query for pending queued emails whose send_after timestamp has passed
-            stmt = (
-                select(EmailOutbox)
-                .where(
-                    EmailOutbox.status == "queued",
-                    EmailOutbox.send_after <= func.now(),
-                )
-                .order_by(EmailOutbox.send_after.asc())
-                .limit(batch_size)
-            )
+        for _ in range(max(0, batch_size)):
+            try:
+                async with session_factory() as session:
+                    # Query exactly 1 pending queued item whose send_after timestamp has passed
+                    stmt = (
+                        select(EmailOutbox)
+                        .where(
+                            EmailOutbox.status == "queued",
+                            EmailOutbox.send_after <= func.now(),
+                        )
+                        .order_by(EmailOutbox.send_after.asc())
+                        .limit(1)
+                    )
+                    if attempted_ids:
+                        stmt = stmt.where(EmailOutbox.id.not_in(attempted_ids))
 
-            # Enable SKIP LOCKED for PostgreSQL concurrency; gracefully omit on SQLite in tests
-            bind = getattr(session, "bind", None)
-            if bind and bind.dialect.name == "postgresql":
-                stmt = stmt.with_for_update(skip_locked=True)
+                    # Enable SKIP LOCKED for PostgreSQL concurrency; gracefully omit on SQLite
+                    bind = getattr(session, "bind", None)
+                    if bind is None:
+                        try:
+                            bind = session.get_bind()
+                        except Exception:
+                            bind = None
 
-            result = await session.execute(stmt)
-            items = list(result.scalars().all())
+                    if bind and hasattr(bind, "dialect") and bind.dialect.name == "postgresql":
+                        stmt = stmt.with_for_update(skip_locked=True)
 
-            for item in items:
-                outcome = await process_single_outbox_item(
-                    session=session,
-                    item=item,
-                    settings=settings,
-                    client=client,
-                )
-                stats["processed"] += 1
-                if outcome in stats:
-                    stats[outcome] += 1
+                    result = await session.execute(stmt)
+                    item = result.scalars().first()
+
+                    if item is None:
+                        # No more eligible queued items available
+                        break
+
+                    attempted_ids.add(item.id)
+
+                    outcome = await process_single_outbox_item(
+                        session=session,
+                        item=item,
+                        settings=settings,
+                        client=client,
+                    )
+                    stats["processed"] += 1
+                    if outcome in stats:
+                        stats[outcome] += 1
+
+                    if outcome == "auth_error":
+                        # Provider credentials failed; halt batch to avoid useless spinning
+                        logger.error(
+                            "Halting outbox batch processing due to auth error on item %s",
+                            item.id,
+                        )
+                        break
+
+            except Exception as batch_err:
+                logger.exception("Error processing outbox item in batch: %s", batch_err)
+                break
     finally:
         if own_client:
             await client.aclose()

@@ -177,9 +177,23 @@ class MockAsyncSession:
 
         # Batch worker query: filtering queued items whose send_after <= now
         now = datetime.now(UTC)
-        queued = self.db.get_queued(as_of=now)
+        excluded_ids: set[UUID] = set()
+        try:
+            params = stmt.compile().params
+            for val in params.values():
+                if isinstance(val, UUID):
+                    excluded_ids.add(val)
+                elif isinstance(val, (list, tuple, set)):
+                    for v in val:
+                        if isinstance(v, UUID):
+                            excluded_ids.add(v)
+        except Exception:
+            pass
+
+        queued = [item for item in self.db.get_queued(as_of=now) if item.id not in excluded_ids]
         mock_res.scalars.return_value.all.return_value = queued
         mock_res.scalars.return_value.first.return_value = queued[0] if queued else None
+        mock_res.scalar_one_or_none.return_value = queued[0] if queued else None
         return mock_res
 
 
@@ -1188,3 +1202,552 @@ def test_webhook_dual_mount_and_idempotency() -> None:
     )
     assert resp2.status_code == status.HTTP_200_OK
     assert resp2.json()["processed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. Concurrency & AUDIT-01 Per-Item Transaction Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_audit01_per_item_discrete_session_lifecycle() -> None:
+    """Verify each queued email is queried and processed in its own discrete transaction."""
+    settings = create_test_settings(email_dev_mode=True)
+    db = InMemoryEmailOutboxDb()
+    now = datetime.now(UTC)
+
+    for i in range(3):
+        db.add(
+            EmailOutbox(
+                id=uuid4(),
+                recipient=f"user{i}@example.com",
+                subject=f"Subject {i}",
+                html_content="<p>Body</p>",
+                text_content="Body",
+                status="queued",
+                attempts=0,
+                max_attempts=5,
+                send_after=now - timedelta(seconds=10),
+            )
+        )
+
+    session_count = 0
+    commit_count = 0
+
+    @asynccontextmanager
+    async def counting_session_factory() -> AsyncIterator[MockAsyncSession]:
+        nonlocal session_count, commit_count
+        session_count += 1
+        session = MockAsyncSession(db)
+        try:
+            yield session
+            if session.committed:
+                commit_count += 1
+        finally:
+            pass
+
+    stats = await process_outbox_batch(
+        session_factory=counting_session_factory,  # type: ignore[arg-type]
+        settings=settings,
+        batch_size=10,
+    )
+
+    assert stats["processed"] == 3
+    assert stats["accepted"] == 3
+    # Exactly 4 sessions opened: 3 for the items processed + 1 for the terminal empty check
+    assert session_count == 4
+    # Exactly 3 commits: one per processed email
+    assert commit_count == 3
+
+
+@pytest.mark.anyio
+async def test_audit01_no_stale_batch_in_memory_processing() -> None:
+    """Verify the worker re-queries the database for each item instead of using stale batch rows."""
+    settings = create_test_settings(email_dev_mode=True)
+    db = InMemoryEmailOutboxDb()
+    now = datetime.now(UTC)
+
+    item1_id = uuid4()
+    item2_id = uuid4()
+
+    db.add(
+        EmailOutbox(
+            id=item1_id,
+            recipient="user1@example.com",
+            subject="Subject 1",
+            html_content="<p>Body</p>",
+            text_content="Body",
+            status="queued",
+            attempts=0,
+            max_attempts=5,
+            send_after=now - timedelta(seconds=10),
+        )
+    )
+    db.add(
+        EmailOutbox(
+            id=item2_id,
+            recipient="user2@example.com",
+            subject="Subject 2",
+            html_content="<p>Body</p>",
+            text_content="Body",
+            status="queued",
+            attempts=0,
+            max_attempts=5,
+            send_after=now - timedelta(seconds=5),
+        )
+    )
+
+    call_index = 0
+
+    @asynccontextmanager
+    async def intercepting_session_factory() -> AsyncIterator[MockAsyncSession]:
+        nonlocal call_index
+        call_index += 1
+        if call_index == 2:
+            # Simulate a concurrent worker or admin canceling/delivering item2 between iterations
+            item2 = db.items[item2_id]
+            item2.status = "accepted_by_provider"
+        yield MockAsyncSession(db)
+
+    stats = await process_outbox_batch(
+        session_factory=intercepting_session_factory,  # type: ignore[arg-type]
+        settings=settings,
+        batch_size=10,
+    )
+
+    # Only item1 was processed by this worker; item2 was skipped because it was already accepted
+    assert stats["processed"] == 1
+    assert stats["accepted"] == 1
+    assert db.items[item1_id].status == "accepted_by_provider"
+    assert db.items[item2_id].status == "accepted_by_provider"
+
+
+@pytest.mark.anyio
+async def test_audit01_multi_worker_skip_locked_simulation() -> None:
+    """Simulate two concurrent workers claiming distinct items without duplication."""
+    settings = create_test_settings(email_dev_mode=True)
+    db = InMemoryEmailOutboxDb()
+    now = datetime.now(UTC)
+
+    id_a = uuid4()
+    id_b = uuid4()
+
+    db.add(
+        EmailOutbox(
+            id=id_a,
+            recipient="workerA@example.com",
+            subject="A",
+            html_content="<p>A</p>",
+            text_content="A",
+            status="queued",
+            attempts=0,
+            max_attempts=5,
+            send_after=now - timedelta(seconds=10),
+        )
+    )
+    db.add(
+        EmailOutbox(
+            id=id_b,
+            recipient="workerB@example.com",
+            subject="B",
+            html_content="<p>B</p>",
+            text_content="B",
+            status="queued",
+            attempts=0,
+            max_attempts=5,
+            send_after=now - timedelta(seconds=5),
+        )
+    )
+
+    # Worker 1 processes 1 item
+    @asynccontextmanager
+    async def factory1() -> AsyncIterator[MockAsyncSession]:
+        yield MockAsyncSession(db)
+
+    stats1 = await process_outbox_batch(
+        session_factory=factory1,  # type: ignore[arg-type]
+        settings=settings,
+        batch_size=1,
+    )
+    assert stats1["processed"] == 1
+    assert db.items[id_a].status == "accepted_by_provider"
+
+    # Worker 2 processes next item
+    @asynccontextmanager
+    async def factory2() -> AsyncIterator[MockAsyncSession]:
+        yield MockAsyncSession(db)
+
+    stats2 = await process_outbox_batch(
+        session_factory=factory2,  # type: ignore[arg-type]
+        settings=settings,
+        batch_size=1,
+    )
+    assert stats2["processed"] == 1
+    assert db.items[id_b].status == "accepted_by_provider"
+
+    # Both items processed exactly once
+    assert db.items[id_a].attempts == 1
+    assert db.items[id_b].attempts == 1
+
+
+@pytest.mark.anyio
+async def test_audit01_batch_statistics_counters_mixed_outcomes() -> None:
+    """Verify batch statistics accurately reflect accepted, failed, and retried items."""
+    settings = create_test_settings(email_dev_mode=False, brevo_api_key="valid-key")
+    db = InMemoryEmailOutboxDb()
+    now = datetime.now(UTC)
+
+    # 1. Normal item
+    id_ok = uuid4()
+    db.add(
+        EmailOutbox(
+            id=id_ok,
+            recipient="ok@example.com",
+            subject="OK",
+            html_content="<p>OK</p>",
+            text_content="OK",
+            status="queued",
+            attempts=0,
+            max_attempts=5,
+            send_after=now - timedelta(seconds=10),
+        )
+    )
+
+    # 2. Permanent failure item
+    id_perm = uuid4()
+    db.add(
+        EmailOutbox(
+            id=id_perm,
+            recipient="bad@example.com",
+            subject="Bad",
+            html_content="<p>Bad</p>",
+            text_content="Bad",
+            status="queued",
+            attempts=0,
+            max_attempts=5,
+            send_after=now - timedelta(seconds=8),
+        )
+    )
+
+    # 3. Transient failure item
+    id_trans = uuid4()
+    db.add(
+        EmailOutbox(
+            id=id_trans,
+            recipient="transient@example.com",
+            subject="Transient",
+            html_content="<p>Transient</p>",
+            text_content="Transient",
+            status="queued",
+            attempts=0,
+            max_attempts=5,
+            send_after=now - timedelta(seconds=6),
+        )
+    )
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[MockAsyncSession]:
+        yield MockAsyncSession(db)
+
+    def mock_brevo_transport(request: httpx.Request) -> httpx.Response:
+        import json
+
+        data = json.loads(request.content.decode("utf-8"))
+        recipient = data["to"][0]["email"]
+        if recipient == "ok@example.com":
+            return httpx.Response(201, json={"messageId": "msg-ok-123"})
+        elif recipient == "bad@example.com":
+            return httpx.Response(400, text="Bad Request: Invalid recipient")
+        else:
+            return httpx.Response(429, text="Too Many Requests")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(mock_brevo_transport)
+    ) as mock_client:
+        stats = await process_outbox_batch(
+            session_factory=factory,  # type: ignore[arg-type]
+            settings=settings,
+            batch_size=10,
+            client=mock_client,
+        )
+
+    assert stats["processed"] == 3
+    assert stats["accepted"] == 1
+    assert stats["failed"] == 1
+    assert stats["retried"] == 1
+    assert stats["auth_error"] == 0
+
+    assert db.items[id_ok].status == "accepted_by_provider"
+    assert db.items[id_perm].status == "failed"
+    assert db.items[id_trans].status == "queued"
+    assert db.items[id_trans].send_after > now
+
+
+@pytest.mark.anyio
+async def test_audit01_no_eligible_items_clean_exit() -> None:
+    """Verify worker terminates cleanly with zero processing when no items are eligible."""
+    settings = create_test_settings(email_dev_mode=True)
+    db = InMemoryEmailOutboxDb()
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[MockAsyncSession]:
+        yield MockAsyncSession(db)
+
+    stats = await process_outbox_batch(
+        session_factory=factory,  # type: ignore[arg-type]
+        settings=settings,
+        batch_size=10,
+    )
+
+    assert stats["processed"] == 0
+    assert stats["accepted"] == 0
+    assert stats["failed"] == 0
+    assert stats["retried"] == 0
+    assert stats["auth_error"] == 0
+
+
+@pytest.mark.anyio
+async def test_audit01_brevo_auth_error_halts_batch_without_spinning() -> None:
+    """Verify BrevoAuthError (401) halts the batch immediately without spinning in a loop."""
+    settings = create_test_settings(email_dev_mode=False, brevo_api_key="bad-key")
+    db = InMemoryEmailOutboxDb()
+    now = datetime.now(UTC)
+
+    for i in range(3):
+        db.add(
+            EmailOutbox(
+                id=uuid4(),
+                recipient=f"user{i}@example.com",
+                subject=f"Subject {i}",
+                html_content="<p>Body</p>",
+                text_content="Body",
+                status="queued",
+                attempts=0,
+                max_attempts=5,
+                send_after=now - timedelta(seconds=10),
+            )
+        )
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[MockAsyncSession]:
+        yield MockAsyncSession(db)
+
+    def mock_brevo_transport(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="Unauthorized: Invalid API key")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(mock_brevo_transport)
+    ) as mock_client:
+        stats = await process_outbox_batch(
+            session_factory=factory,  # type: ignore[arg-type]
+            settings=settings,
+            batch_size=10,
+            client=mock_client,
+        )
+
+    # Exactly 1 item was attempted before the batch halted
+    assert stats["processed"] == 1
+    assert stats["auth_error"] == 1
+    assert stats["accepted"] == 0
+
+
+@pytest.mark.anyio
+async def test_audit01_attempted_ids_deduplication_prevents_reselection() -> None:
+    """Verify attempted_ids prevents the worker from re-selecting an item that remains queued."""
+    settings = create_test_settings(email_dev_mode=True)
+    db = InMemoryEmailOutboxDb()
+    now = datetime.now(UTC)
+    item_id = uuid4()
+
+    item = EmailOutbox(
+        id=item_id,
+        recipient="user@example.com",
+        subject="Subject",
+        html_content="<p>Body</p>",
+        text_content="Body",
+        status="queued",
+        attempts=0,
+        max_attempts=5,
+        send_after=now - timedelta(seconds=10),
+    )
+    db.add(item)
+
+    query_count = 0
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[MockAsyncSession]:
+        nonlocal query_count
+        query_count += 1
+        yield MockAsyncSession(db)
+
+    stats = await process_outbox_batch(
+        session_factory=factory,  # type: ignore[arg-type]
+        settings=settings,
+        batch_size=5,
+    )
+
+    assert stats["processed"] == 1
+    assert query_count == 2  # 1 for item + 1 for next check which finds no non-attempted item
+
+
+@pytest.mark.anyio
+async def test_audit01_bounded_processing_respects_batch_size() -> None:
+    """Verify process_outbox_batch terminates after exactly batch_size items."""
+    settings = create_test_settings(email_dev_mode=True)
+    db = InMemoryEmailOutboxDb()
+    now = datetime.now(UTC)
+
+    for i in range(5):
+        db.add(
+            EmailOutbox(
+                id=uuid4(),
+                recipient=f"user{i}@example.com",
+                subject=f"Subject {i}",
+                html_content="<p>Body</p>",
+                text_content="Body",
+                status="queued",
+                attempts=0,
+                max_attempts=5,
+                send_after=now - timedelta(seconds=10),
+            )
+        )
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[MockAsyncSession]:
+        yield MockAsyncSession(db)
+
+    stats = await process_outbox_batch(
+        session_factory=factory,  # type: ignore[arg-type]
+        settings=settings,
+        batch_size=2,
+    )
+
+    assert stats["processed"] == 2
+    assert stats["accepted"] == 2
+    # 3 remaining items are still queued
+    queued_remaining = [it for it in db.items.values() if it.status == "queued"]
+    assert len(queued_remaining) == 3
+
+
+@pytest.mark.anyio
+async def test_audit01_worker_exception_rolls_back_safely() -> None:
+    """Verify unexpected database or worker errors in the batch loop log and break cleanly."""
+    settings = create_test_settings(email_dev_mode=True)
+
+    @asynccontextmanager
+    async def failing_factory() -> AsyncIterator[Any]:
+        if False:
+            yield
+        raise RuntimeError("Database connection lost")
+
+    stats = await process_outbox_batch(
+        session_factory=failing_factory,  # type: ignore[arg-type]
+        settings=settings,
+        batch_size=5,
+    )
+
+    assert stats["processed"] == 0
+    assert stats["accepted"] == 0
+
+
+@pytest.mark.anyio
+async def test_audit01_genuine_sqlalchemy_orm_per_item_transactions() -> None:
+    """Verify discrete per-item transactions with real SQLAlchemy ORM on SQLite."""
+    import json
+    import sqlite3
+
+    sqlite3.register_adapter(list, lambda val: json.dumps(val))
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+    from sqlalchemy.ext.compiler import compiles
+    from sqlalchemy.orm import sessionmaker
+
+    @compiles(ARRAY, "sqlite")
+    def _compile_array(element: Any, compiler: Any, **kw: Any) -> str:
+        return "TEXT"
+
+    @compiles(JSONB, "sqlite")
+    def _compile_jsonb(element: Any, compiler: Any, **kw: Any) -> str:
+        return "TEXT"
+
+    engine = create_engine("sqlite:///:memory:")
+    EmailOutbox.metadata.create_all(engine)
+    sm = sessionmaker(engine, expire_on_commit=False)
+
+    now = datetime.now(UTC)
+    id1 = uuid4()
+    id2 = uuid4()
+
+    with sm() as s:
+        s.add(
+            EmailOutbox(
+                id=id1,
+                recipient="real1@example.com",
+                subject="Real 1",
+                html_content="<p>1</p>",
+                text_content="1",
+                tags=[],
+                status="queued",
+                attempts=0,
+                max_attempts=5,
+                send_after=now - timedelta(seconds=10),
+            )
+        )
+        s.add(
+            EmailOutbox(
+                id=id2,
+                recipient="real2@example.com",
+                subject="Real 2",
+                html_content="<p>2</p>",
+                text_content="2",
+                tags=[],
+                status="queued",
+                attempts=0,
+                max_attempts=5,
+                send_after=now - timedelta(seconds=5),
+            )
+        )
+        s.commit()
+
+    # Wrap sm in an async session adapter
+    class AsyncSqliteAdapter:
+        def __init__(self, sync_s: Any) -> None:
+            self.sync_s = sync_s
+            self.bind = engine
+
+        async def execute(self, stmt: Any, *args: Any, **kwargs: Any) -> Any:
+            return self.sync_s.execute(stmt, *args, **kwargs)
+
+        async def commit(self) -> None:
+            self.sync_s.commit()
+
+        async def flush(self) -> None:
+            self.sync_s.flush()
+
+        async def rollback(self) -> None:
+            self.sync_s.rollback()
+
+    @asynccontextmanager
+    async def orm_factory() -> AsyncIterator[AsyncSqliteAdapter]:
+        with sm() as sync_s:
+            yield AsyncSqliteAdapter(sync_s)
+
+    settings = create_test_settings(email_dev_mode=True)
+    stats = await process_outbox_batch(
+        session_factory=orm_factory,  # type: ignore[arg-type]
+        settings=settings,
+        batch_size=10,
+    )
+
+    assert stats["processed"] == 2
+    assert stats["accepted"] == 2
+
+    # Verify rows in DB were updated
+    with sm() as s:
+        r1 = s.get(EmailOutbox, id1)
+        r2 = s.get(EmailOutbox, id2)
+        assert r1 is not None and r1.status == "accepted_by_provider"
+        assert r2 is not None and r2.status == "accepted_by_provider"
+        assert r1.attempts == 1
+        assert r2.attempts == 1
