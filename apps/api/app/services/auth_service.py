@@ -7,10 +7,12 @@ from fastapi import status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.core.security import (
+    generate_action_token,
     generate_session_token,
+    hash_action_token,
     hash_password,
     hash_session_token,
     validate_password_strength,
@@ -18,11 +20,16 @@ from app.core.security import (
     verify_password,
 )
 from app.db.models import User, UserProfile, UserSession
-from app.db.repositories import session_repo, user_repo
+from app.db.repositories import session_repo, user_repo, verification_repo
 from app.schemas.auth import LoginRequest, SignupRequest
+from app.services import email_service
 
 
-async def signup(session: AsyncSession, payload: SignupRequest) -> User:
+async def signup(
+    session: AsyncSession,
+    payload: SignupRequest,
+    settings: Settings | None = None,
+) -> User:
     """Register a new Tenant or Owner account.
 
     Rejects Admin role registrations, validates password strength, ensures case-insensitive
@@ -74,6 +81,29 @@ async def signup(session: AsyncSession, payload: SignupRequest) -> User:
                 full_name=payload.full_name,
                 phone=payload.phone,
                 institution_id=payload.institution_id,
+            )
+
+            # 6. Generate email verification token and queue verification email (T-10)
+            raw_token = generate_action_token()
+            token_hash = hash_action_token(raw_token)
+            now = datetime.now(UTC)
+            expires_at = now + timedelta(hours=24)
+
+            await verification_repo.create_verification_token(
+                session=session,
+                user_id=user.id,
+                token_hash=token_hash,
+                expires_at=expires_at,
+            )
+
+            resolved_settings = settings or get_settings()
+            email_service.queue_verification_email(
+                session=session,
+                recipient=user.email,
+                recipient_name=payload.full_name,
+                raw_token=raw_token,
+                settings=resolved_settings,
+                user_id=user.id,
             )
     except IntegrityError as exc:
         orig = getattr(exc, "orig", exc)
@@ -381,3 +411,178 @@ async def get_user_profile(
 ) -> tuple[User, UserProfile | None] | None:
     """Fetch user account and profile for /auth/me."""
     return await user_repo.get_user_with_profile(session, user_id)
+
+
+async def verify_email(
+    session: AsyncSession,
+    token: str,
+) -> User:
+    """Verify user's email address using a single-use action token (T-10).
+
+    Acceptance criteria:
+    - Token works once; expired and reused tokens show clear messages.
+    - Token hash is looked up in PostgreSQL.
+    - If expired: raises TOKEN_EXPIRED (HTTP 400).
+    - If already used: raises TOKEN_ALREADY_USED (HTTP 400).
+    - If invalid or unknown: raises TOKEN_INVALID (HTTP 400).
+    - If account disabled/suspended/banned: raises ACCOUNT_DISABLED (HTTP 403).
+    - On success: marks token used and records email_verified_at.
+    """
+    clean_token = token.strip()
+    if not clean_token or len(clean_token) < 10:
+        raise AppError(
+            code="TOKEN_INVALID",
+            message="Invalid or malformed verification token.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    token_hash = hash_action_token(clean_token)
+    token_row = await verification_repo.get_verification_token_by_hash(session, token_hash)
+
+    if token_row is None:
+        raise AppError(
+            code="TOKEN_INVALID",
+            message="Invalid or malformed verification token.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if token_row.used_at is not None:
+        raise AppError(
+            code="TOKEN_ALREADY_USED",
+            message="This verification token has already been used.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    now = datetime.now(UTC)
+    expires_at = (
+        token_row.expires_at.replace(tzinfo=UTC)
+        if token_row.expires_at.tzinfo is None
+        else token_row.expires_at
+    )
+
+    if now >= expires_at:
+        raise AppError(
+            code="TOKEN_EXPIRED",
+            message="This verification token has expired. Please request a new verification link.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    user = await user_repo.get_user_by_id(session, token_row.user_id)
+    if user is None:
+        raise AppError(
+            code="USER_NOT_FOUND",
+            message="User associated with this token was not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    if user.status != "active":
+        if user.status == "suspended":
+            msg = "Account is suspended."
+        elif user.status == "banned":
+            msg = "Account is banned."
+        else:
+            msg = "Account is inactive."
+        raise AppError(
+            code="ACCOUNT_DISABLED",
+            message=msg,
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    # Atomically mark token used and update email_verified_at
+    marked = await verification_repo.mark_token_used(session, token_row.id, now)
+    if not marked:
+        # Atomic conditional update affected 0 rows, meaning a concurrent request
+        # consumed the token or it expired at the boundary.
+        # Fetch fresh database state with populate_existing=True to bypass identity map cache.
+        fresh_token = await verification_repo.get_verification_token_by_hash(
+            session, token_hash, populate_existing=True
+        )
+        if fresh_token is not None and fresh_token.used_at is not None:
+            raise AppError(
+                code="TOKEN_ALREADY_USED",
+                message="This verification token has already been used.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if fresh_token is not None and now >= (
+            fresh_token.expires_at.replace(tzinfo=UTC)
+            if fresh_token.expires_at.tzinfo is None
+            else fresh_token.expires_at
+        ):
+            raise AppError(
+                code="TOKEN_EXPIRED",
+                message=(
+                    "This verification token has expired. Please request a new verification link."
+                ),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        raise AppError(
+            code="TOKEN_INVALID",
+            message="Invalid or malformed verification token.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if user.email_verified_at is None:
+        await user_repo.mark_user_email_verified(session, user.id, now)
+        user.email_verified_at = now
+
+    return user
+
+
+async def resend_verification(
+    session: AsyncSession,
+    email: str,
+    settings: Settings,
+) -> None:
+    """Resend email verification token (T-10).
+
+    Acceptance criteria:
+    - Does not leak whether the account exists (constant-time behavior, identical response).
+    - If account exists and is unverified (and active):
+      - Invalidates previous verification tokens.
+      - Creates a new random token with 24-hour expiry.
+      - Queues verification email in outbox.
+    """
+    clean_email = email.strip().lower()
+    user = await user_repo.get_user_by_email_ci(session, clean_email)
+
+    if user is None:
+        # Prevent timing-based user enumeration
+        verify_dummy_password()
+        return
+
+    # If user is suspended or banned, fail silently without leaking status
+    if user.status != "active":
+        verify_dummy_password()
+        return
+
+    # If user is already verified, do not send verification email; don't leak status
+    if user.email_verified_at is not None:
+        verify_dummy_password()
+        return
+
+    # User exists, active, and unverified: generate fresh token
+    now = datetime.now(UTC)
+    await verification_repo.invalidate_user_verification_tokens(session, user.id, now)
+
+    raw_token = generate_action_token()
+    token_hash = hash_action_token(raw_token)
+    expires_at = now + timedelta(hours=24)
+
+    await verification_repo.create_verification_token(
+        session=session,
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=expires_at,
+    )
+
+    profile_row = await user_repo.get_user_with_profile(session, user.id)
+    recipient_name = profile_row[1].full_name if profile_row and profile_row[1] else None
+
+    email_service.queue_verification_email(
+        session=session,
+        recipient=user.email,
+        recipient_name=recipient_name,
+        raw_token=raw_token,
+        settings=settings,
+        user_id=user.id,
+    )

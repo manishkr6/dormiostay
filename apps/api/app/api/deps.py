@@ -142,3 +142,24 @@ async def get_current_user(
 ) -> User:
     """Dependency yielding the currently authenticated User model."""
     return session_and_user[1]
+
+
+async def require_verified_user(
+    session_and_user: Annotated[tuple[UserSession, User], Depends(get_current_session_and_user)],
+) -> tuple[UserSession, User]:
+    """Ensure that the authenticated user has verified their email address.
+
+    Unverified users can browse public listings and log in, but restricted actions
+    (e.g., requesting visits, submitting owner applications) return HTTP 403 Forbidden
+    with code EMAIL_NOT_VERIFIED so the frontend or native client can explain the requirement.
+    """
+    _, user = session_and_user
+    if user.email_verified_at is None:
+        raise AppError(
+            code="EMAIL_NOT_VERIFIED",
+            message=(
+                "Email verification is required to perform this action. Please verify your email."
+            ),
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    return session_and_user

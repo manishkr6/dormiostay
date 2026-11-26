@@ -135,3 +135,46 @@ class CsrfResponse(BaseModel):
     """CSRF token response payload for Web client."""
 
     token: str = Field(..., description="CSRF token for state-changing Web requests")
+
+
+class VerifyEmailRequest(BaseModel):
+    """Payload to verify email using an action token."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(..., min_length=1, max_length=255, description="Verification action token")
+
+    @field_validator("token", mode="before")
+    @classmethod
+    def strip_token(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
+
+class ResendVerificationRequest(BaseModel):
+    """Payload to request resending a verification email."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(..., max_length=255, description="Account email address")
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def strip_email(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not EMAIL_PATTERN.match(cleaned):
+            raise ValueError("Invalid email address format.")
+        return cleaned
+
+
+class VerificationResponse(BaseModel):
+    """Response payload for email verification actions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = Field(default="ok")
+    message: str = Field(..., description="Human-readable result message")

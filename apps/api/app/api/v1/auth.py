@@ -20,6 +20,7 @@ from app.core.errors import AppError
 from app.core.rate_limit import (
     rate_limit_csrf,
     rate_limit_login,
+    rate_limit_resend_verification,
     rate_limit_signup,
 )
 from app.db.models import User, UserSession
@@ -31,9 +32,12 @@ from app.schemas.auth import (
     LoginRequest,
     MeResponse,
     ProfileResponse,
+    ResendVerificationRequest,
     SignupRequest,
     StatusResponse,
     UserResponse,
+    VerificationResponse,
+    VerifyEmailRequest,
 )
 from app.services import auth_service
 
@@ -109,9 +113,10 @@ async def get_csrf(
 async def signup(
     payload: SignupRequest,
     db_session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> UserResponse:
-    """Create a new account with Argon2id password hashing and profile record."""
-    user = await auth_service.signup(session=db_session, payload=payload)
+    """Create a new account with Argon2id password hashing, profile, and verification email."""
+    user = await auth_service.signup(session=db_session, payload=payload, settings=settings)
     return UserResponse(
         id=user.id,
         email=user.email,
@@ -119,6 +124,52 @@ async def signup(
         status=user.status,
         email_verified=user.email_verified_at is not None,
         created_at=user.created_at,
+    )
+
+
+@router.post(
+    "/verify-email",
+    response_model=VerificationResponse,
+    summary="Verify account email address using action token",
+)
+async def verify_email(
+    payload: VerifyEmailRequest,
+    db_session: Annotated[AsyncSession, Depends(get_session)],
+) -> VerificationResponse:
+    """Verify user's email address using a single-use action token (T-10).
+
+    Acceptance criteria:
+    - Token works once; expired and reused tokens show clear messages.
+    - Both-client verification link contract: Web and Native clients call this endpoint.
+    - Action tokens are never logged.
+    """
+    await auth_service.verify_email(session=db_session, token=payload.token)
+    return VerificationResponse(status="ok", message="Email verified successfully.")
+
+
+@router.post(
+    "/resend-verification",
+    response_model=VerificationResponse,
+    dependencies=[Depends(rate_limit_resend_verification)],
+    summary="Resend verification email to unverified account",
+)
+async def resend_verification(
+    payload: ResendVerificationRequest,
+    db_session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> VerificationResponse:
+    """Request a new email verification link (T-10).
+
+    Acceptance criteria:
+    - Rate-limited (dual IP and email policy).
+    - Does not leak whether the account exists or is already verified.
+    """
+    await auth_service.resend_verification(
+        session=db_session, email=payload.email, settings=settings
+    )
+    return VerificationResponse(
+        status="ok",
+        message="If that email exists and is unverified, a verification link has been sent.",
     )
 
 

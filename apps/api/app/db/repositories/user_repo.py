@@ -102,3 +102,13 @@ async def update_login_failure(
         .values(failed_login_count=User.failed_login_count + 1)
     )
     await session.execute(stmt)
+
+
+async def mark_user_email_verified(
+    session: AsyncSession,
+    user_id: UUID,
+    verified_at: datetime,
+) -> None:
+    """Record email verification timestamp on the user."""
+    stmt = update(User).where(User.id == user_id).values(email_verified_at=verified_at)
+    await session.execute(stmt)

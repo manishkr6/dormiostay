@@ -23,7 +23,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
-from app.schemas.auth import LoginRequest
+from app.schemas.auth import LoginRequest, ResendVerificationRequest
 
 logger = logging.getLogger(__name__)
 
@@ -127,12 +127,21 @@ RULE_PASSWORD_RESET_EMAIL = RateLimitRule(
     fallback_window_seconds=60 * 60,
 )
 
-# Resend verification: 3 per hour (prepared for T-10).
+# Resend verification: 3 per hour (T-10).
 RULE_RESEND_VERIFICATION_EMAIL = RateLimitRule(
     name="resend_verification_email",
     max_requests=3,
     window_seconds=60 * 60,
     fallback_max_requests=2,
+    fallback_window_seconds=60 * 60,
+)
+
+# Resend verification per IP: 10 per hour (T-10).
+RULE_RESEND_VERIFICATION_IP = RateLimitRule(
+    name="resend_verification_ip",
+    max_requests=10,
+    window_seconds=60 * 60,
+    fallback_max_requests=5,
     fallback_window_seconds=60 * 60,
 )
 
@@ -554,6 +563,45 @@ async def rate_limit_login(
     email_result = await evaluate_rate_limit(email_key, RULE_LOGIN_EMAIL, settings)
 
     # If either limit exceeded, enforce the one that failed (or the stricter retry_after)
+    if not ip_result.allowed:
+        enforce_rate_limit(ip_result)
+    if not email_result.allowed:
+        enforce_rate_limit(email_result)
+
+    # For successful requests, headers reflect the stricter (lower remaining) counter
+    if email_result.remaining < ip_result.remaining:
+        set_rate_limit_headers(response, email_result)
+    else:
+        set_rate_limit_headers(response, ip_result)
+
+
+async def rate_limit_resend_verification(
+    request: Request,
+    response: Response,
+    payload: ResendVerificationRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> None:
+    """Rate limit resend verification requests by both client IP and account email.
+
+    Dual-limit policy:
+    1. Per-IP: 10 attempts per hour (fallback 5) to prevent mass spam.
+    2. Per-Email: 3 attempts per hour (fallback 2) to prevent user harassment.
+    """
+    if not settings.rate_limit_enabled:
+        return
+
+    client_ip = get_client_ip(request, settings)
+
+    # 1. Per-IP evaluation
+    ip_key = make_rate_limit_key("resend_verification", "ip", client_ip)
+    ip_result = await evaluate_rate_limit(ip_key, RULE_RESEND_VERIFICATION_IP, settings)
+
+    # 2. Per-Email evaluation
+    normalized_email = payload.email.strip().lower()
+    email_key = make_rate_limit_key("resend_verification", "email", normalized_email)
+    email_result = await evaluate_rate_limit(email_key, RULE_RESEND_VERIFICATION_EMAIL, settings)
+
+    # If either limit exceeded, enforce the one that failed
     if not ip_result.allowed:
         enforce_rate_limit(ip_result)
     if not email_result.allowed:

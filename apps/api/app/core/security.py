@@ -102,3 +102,16 @@ def hash_session_token(token: str) -> str:
     Conforms to the ck_user_sessions_token_hash constraint: ^[0-9a-f]{64}$
     """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def generate_action_token() -> str:
+    """Generate a cryptographically secure opaque action token for verification or reset."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_action_token(token: str) -> str:
+    """Compute the SHA-256 hex digest of an action token for storage in PostgreSQL.
+
+    Conforms to the ck_email_verification_tokens_token_hash constraint: ^[0-9a-f]{64}$
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()

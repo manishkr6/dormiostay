@@ -26,6 +26,8 @@ PRE_AUTH_PATHS = frozenset(
     {
         "/api/v1/auth/signup",
         "/api/v1/auth/login",
+        "/api/v1/auth/verify-email",
+        "/api/v1/auth/resend-verification",
     }
 )
 
