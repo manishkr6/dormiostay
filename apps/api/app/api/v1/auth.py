@@ -19,8 +19,10 @@ from app.core.csrf import (
 from app.core.errors import AppError
 from app.core.rate_limit import (
     rate_limit_csrf,
+    rate_limit_forgot_password,
     rate_limit_login,
     rate_limit_resend_verification,
+    rate_limit_reset_password,
     rate_limit_signup,
 )
 from app.db.models import User, UserSession
@@ -29,10 +31,12 @@ from app.schemas.auth import (
     AuthResponseNative,
     AuthResponseWeb,
     CsrfResponse,
+    ForgotPasswordRequest,
     LoginRequest,
     MeResponse,
     ProfileResponse,
     ResendVerificationRequest,
+    ResetPasswordRequest,
     SignupRequest,
     StatusResponse,
     UserResponse,
@@ -170,6 +174,66 @@ async def resend_verification(
     return VerificationResponse(
         status="ok",
         message="If that email exists and is unverified, a verification link has been sent.",
+    )
+
+
+@router.post(
+    "/forgot-password",
+    response_model=VerificationResponse,
+    dependencies=[Depends(rate_limit_forgot_password)],
+    summary="Request password reset link",
+)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    db_session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> VerificationResponse:
+    """Request a password reset link for an account (T-11).
+
+    Acceptance criteria:
+    - Rate-limited (dual IP and email policy).
+    - Constant-time anti-enumeration response ('If that email exists, we sent a link').
+    - 30-minute single-use hashed token queued via transactional outbox.
+    """
+    await auth_service.forgot_password(session=db_session, email=payload.email, settings=settings)
+    return VerificationResponse(
+        status="ok",
+        message="If that email exists, we sent a link.",
+    )
+
+
+@router.post(
+    "/reset-password",
+    response_model=VerificationResponse,
+    dependencies=[Depends(rate_limit_reset_password)],
+    summary="Reset account password using action token",
+)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    request: Request,
+    response: Response,
+    db_session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> VerificationResponse:
+    """Reset account password using a single-use action token (T-11).
+
+    Acceptance criteria:
+    - Single-use hashed token, 30-minute expiry.
+    - Revokes every session of that user globally.
+    - Clears ambient session cookie if present.
+    - Password strength policy enforced (minimum 10 characters, common password blocklist).
+    """
+    await auth_service.reset_password(
+        session=db_session,
+        token=payload.token,
+        new_password=payload.new_password,
+        request=request,
+        response=response,
+        settings=settings,
+    )
+    return VerificationResponse(
+        status="ok",
+        message="Password has been reset successfully. Please log in with your new password.",
     )
 
 

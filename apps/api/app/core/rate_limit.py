@@ -23,7 +23,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
-from app.schemas.auth import LoginRequest, ResendVerificationRequest
+from app.schemas.auth import ForgotPasswordRequest, LoginRequest, ResendVerificationRequest
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,24 @@ RULE_PASSWORD_RESET_EMAIL = RateLimitRule(
     max_requests=3,
     window_seconds=60 * 60,
     fallback_max_requests=2,
+    fallback_window_seconds=60 * 60,
+)
+
+# Password reset per IP: 10 per hour (T-11).
+RULE_PASSWORD_RESET_IP = RateLimitRule(
+    name="password_reset_ip",
+    max_requests=10,
+    window_seconds=60 * 60,
+    fallback_max_requests=5,
+    fallback_window_seconds=60 * 60,
+)
+
+# Password reset submission per IP: 10 per hour (T-11).
+RULE_RESET_PASSWORD_SUBMISSION_IP = RateLimitRule(
+    name="reset_password_submission_ip",
+    max_requests=10,
+    window_seconds=60 * 60,
+    fallback_max_requests=5,
     fallback_window_seconds=60 * 60,
 )
 
@@ -612,3 +630,64 @@ async def rate_limit_resend_verification(
         set_rate_limit_headers(response, email_result)
     else:
         set_rate_limit_headers(response, ip_result)
+
+
+async def rate_limit_forgot_password(
+    request: Request,
+    response: Response,
+    payload: ForgotPasswordRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> None:
+    """Rate limit password reset requests (forgot password) by client IP and account email (T-11).
+
+    Dual-limit policy:
+    1. Per-IP: 10 attempts per hour (fallback 5) to prevent mass spam.
+    2. Per-Email: 3 attempts per hour (fallback 2) to prevent user harassment.
+    """
+    if not settings.rate_limit_enabled:
+        return
+
+    client_ip = get_client_ip(request, settings)
+
+    # 1. Per-IP evaluation
+    ip_key = make_rate_limit_key("password_reset", "ip", client_ip)
+    ip_result = await evaluate_rate_limit(ip_key, RULE_PASSWORD_RESET_IP, settings)
+
+    # 2. Per-Email evaluation
+    normalized_email = payload.email.strip().lower()
+    email_key = make_rate_limit_key("password_reset", "email", normalized_email)
+    email_result = await evaluate_rate_limit(email_key, RULE_PASSWORD_RESET_EMAIL, settings)
+
+    # If either limit exceeded, enforce the one that failed
+    if not ip_result.allowed:
+        enforce_rate_limit(ip_result)
+    if not email_result.allowed:
+        enforce_rate_limit(email_result)
+
+    # For successful requests, headers reflect the stricter counter
+    if email_result.remaining < ip_result.remaining:
+        set_rate_limit_headers(response, email_result)
+    else:
+        set_rate_limit_headers(response, ip_result)
+
+
+async def rate_limit_reset_password(
+    request: Request,
+    response: Response,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> None:
+    """Rate limit password reset submission by client IP (T-11).
+
+    Limits submissions to 10 per hour (fallback 5) to prevent token brute force and CPU exhaustion.
+    """
+    if not settings.rate_limit_enabled:
+        return
+
+    client_ip = get_client_ip(request, settings)
+    ip_key = make_rate_limit_key("reset_password_submission", "ip", client_ip)
+    ip_result = await evaluate_rate_limit(ip_key, RULE_RESET_PASSWORD_SUBMISSION_IP, settings)
+
+    if not ip_result.allowed:
+        enforce_rate_limit(ip_result)
+
+    set_rate_limit_headers(response, ip_result)

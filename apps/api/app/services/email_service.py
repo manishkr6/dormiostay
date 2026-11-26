@@ -208,6 +208,140 @@ def queue_verification_email(
     )
 
 
+def build_password_reset_email(
+    recipient_name: str | None,
+    action_link: str,
+) -> tuple[str, str, str]:
+    """Build subject, HTML, and text content for password reset email (T-11).
+
+    Acceptance criteria:
+    - Clear 30-minute single-use expiration notice.
+    - Security advice regarding unrecognized requests.
+    - No session token or sensitive credential ever placed in email.
+    """
+    display_name = recipient_name or "there"
+    subject = "Reset your DormioStay password"
+
+    text_content = f"""Hello {display_name},
+
+We received a request to reset your password for your DormioStay account.
+
+To reset your password, please open the following link in your browser or mobile app:
+{action_link}
+
+This link is single-use and will expire in 30 minutes.
+
+If you did not request a password reset, you can safely ignore this email.
+Your password will not change until you access the link above and create a new one.
+
+Best regards,
+The DormioStay Team
+"""
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Reset your DormioStay password</title>
+  <style>
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background-color: #f8fafc;
+      margin: 0;
+      padding: 24px;
+      color: #1e293b;
+    }}
+    .container {{
+      max-width: 560px;
+      margin: 0 auto;
+      background: #ffffff;
+      border-radius: 8px;
+      border: 1px solid #e2e8f0;
+      padding: 32px;
+    }}
+    .logo {{ font-size: 24px; font-weight: bold; color: #0284c7; margin-bottom: 24px; }}
+    .button {{
+      display: inline-block;
+      background-color: #0284c7;
+      color: #ffffff !important;
+      padding: 12px 24px;
+      text-decoration: none;
+      border-radius: 6px;
+      font-weight: 600;
+      margin: 20px 0;
+    }}
+    .footer {{
+      margin-top: 32px;
+      font-size: 13px;
+      color: #64748b;
+      border-top: 1px solid #e2e8f0;
+      padding-top: 16px;
+    }}
+    .break-url {{ word-break: break-all; color: #0284c7; font-size: 13px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">DormioStay</div>
+    <h2>Reset your password</h2>
+    <p>Hello {display_name},</p>
+    <p>We received a request to reset your password for your DormioStay account.</p>
+    <p>Please click the button below to choose a new password:</p>
+    <p style="text-align: center;">
+      <a href="{action_link}" class="button" target="_blank" rel="noopener noreferrer">
+        Reset Password
+      </a>
+    </p>
+    <p>Or copy and paste this link into your browser or mobile app:</p>
+    <p class="break-url"><a href="{action_link}">{action_link}</a></p>
+    <p style="font-size: 13px; color: #64748b;">
+      This link is single-use and will expire in 30 minutes.
+    </p>
+    <div class="footer">
+      <p>If you did not request a password reset, you can safely ignore this email.</p>
+      <p>Your password will not change until you access the link above and create a new one.</p>
+      <p>&copy; 2026 DormioStay. All rights reserved.</p>
+    </div>
+  </div>
+</body>
+</html>"""
+
+    return subject, html_content, text_content
+
+
+def queue_password_reset_email(
+    session: AsyncSession,
+    recipient: str,
+    recipient_name: str | None,
+    raw_token: str,
+    settings: Settings,
+    user_id: UUID | None = None,
+) -> EmailOutbox:
+    """Format and queue a password reset email in the transactional outbox (T-11)."""
+    frontend_base = str(settings.frontend_origin).rstrip("/")
+    action_link = f"{frontend_base}/reset-password?token={raw_token}"
+    subject, html_content, text_content = build_password_reset_email(
+        recipient_name=recipient_name,
+        action_link=action_link,
+    )
+    metadata: dict[str, Any] = {
+        "action": "password_reset",
+    }
+    if user_id is not None:
+        metadata["user_id"] = str(user_id)
+
+    return queue_email(
+        session=session,
+        recipient=recipient,
+        subject=subject,
+        html_content=html_content,
+        text_content=text_content,
+        recipient_name=recipient_name,
+        tags=["auth", "password_reset"],
+        metadata=metadata,
+    )
+
+
 async def send_outbox_email(
     item: EmailOutbox,
     settings: Settings,

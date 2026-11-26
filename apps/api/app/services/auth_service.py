@@ -3,7 +3,7 @@
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from fastapi import status
+from fastapi import Request, Response, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -20,7 +20,12 @@ from app.core.security import (
     verify_password,
 )
 from app.db.models import User, UserProfile, UserSession
-from app.db.repositories import session_repo, user_repo, verification_repo
+from app.db.repositories import (
+    password_reset_repo,
+    session_repo,
+    user_repo,
+    verification_repo,
+)
 from app.schemas.auth import LoginRequest, SignupRequest
 from app.services import email_service
 
@@ -234,7 +239,19 @@ async def login(
 
     now = datetime.now(UTC)
 
-    # 6. Session Rotation: If Web client presented an existing ambient cookie, revoke it
+    # 6. Revalidate credentials have not changed, acquire row lock on users,
+    # and record login timestamp
+    updated = await user_repo.update_login_success(
+        session, user.id, now, expected_password_hash=user.password_hash
+    )
+    if updated is False:
+        raise AppError(
+            code="AUTHENTICATION_FAILED",
+            message="Email or password is incorrect.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    # 7. Session Rotation: If Web client presented an existing ambient cookie, revoke it
     if client_type == "web" and existing_cookie_token:
         old_token_hash = hash_session_token(existing_cookie_token.strip())
         old_row = await session_repo.get_session_with_user_by_token_hash(session, old_token_hash)
@@ -246,7 +263,7 @@ async def login(
                 reason="session_rotation",
             )
 
-    # 7. Generate 32-byte cryptographic token and SHA-256 hash
+    # 8. Generate 32-byte cryptographic token and SHA-256 hash
     raw_token = generate_session_token()
     token_hash = hash_session_token(raw_token)
 
@@ -260,7 +277,7 @@ async def login(
     expires_at = now + idle_delta
     absolute_expires_at = now + abs_delta
 
-    # 8. Persist session in PostgreSQL user_sessions
+    # 9. Persist session in PostgreSQL user_sessions
     user_session = await session_repo.create_session(
         session=session,
         user_id=user.id,
@@ -269,9 +286,6 @@ async def login(
         absolute_expires_at=absolute_expires_at,
         created_at=now,
     )
-
-    # 9. Reset failed login counter and record last login
-    await user_repo.update_login_success(session, user.id, now)
 
     return raw_token, user, user_session
 
@@ -586,3 +600,199 @@ async def resend_verification(
         settings=settings,
         user_id=user.id,
     )
+
+
+async def forgot_password(
+    session: AsyncSession,
+    email: str,
+    settings: Settings,
+) -> None:
+    """Request password reset token (T-11).
+
+    Acceptance criteria:
+    - Always responds 'If that email exists, we sent a link'.
+    - Identical response and similar timing for known and unknown emails (anti-enumeration).
+    - If account exists and is active:
+      - Invalidates previous reset tokens.
+      - Creates a new random single-use token with 30-minute expiry.
+      - Queues password reset email in outbox.
+    """
+    clean_email = email.strip().lower()
+    user = await user_repo.get_user_by_email_ci(session, clean_email)
+
+    if user is None or user.status != "active":
+        # Simulate token generation and hashing overhead to normalize execution path
+        dummy_token = generate_action_token()
+        _ = hash_action_token(dummy_token)
+        return
+
+    # User exists and is active: invalidate prior unused reset tokens
+    now = datetime.now(UTC)
+    await password_reset_repo.invalidate_user_reset_tokens(session, user.id, now)
+
+    raw_token = generate_action_token()
+    token_hash = hash_action_token(raw_token)
+    expires_at = now + timedelta(minutes=30)
+
+    await password_reset_repo.create_reset_token(
+        session=session,
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=expires_at,
+    )
+
+    profile_row = await user_repo.get_user_with_profile(session, user.id)
+    recipient_name = profile_row[1].full_name if profile_row and profile_row[1] else None
+
+    email_service.queue_password_reset_email(
+        session=session,
+        recipient=user.email,
+        recipient_name=recipient_name,
+        raw_token=raw_token,
+        settings=settings,
+        user_id=user.id,
+    )
+
+
+async def reset_password(
+    session: AsyncSession,
+    token: str,
+    new_password: str,
+    request: Request | None = None,
+    response: Response | None = None,
+    settings: Settings | None = None,
+) -> User:
+    """Reset user password using single-use action token (T-11).
+
+    Acceptance criteria:
+    - Single-use hashed token with 30-minute expiry.
+    - Token reuse and expiry are rejected with clear messages.
+    - Password strength validated (min 10 chars, not in common password blocklist).
+    - A successful reset revokes EVERY session of that user globally.
+    - Ambient session cookie is cleared if present in response.
+    """
+    # 1. Validate new password strength upfront
+    is_valid, msg = validate_password_strength(new_password)
+    if not is_valid:
+        raise AppError(
+            code="WEAK_PASSWORD",
+            message=msg or "Password does not meet security requirements.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # 2. Validate token format
+    clean_token = token.strip()
+    if not clean_token or len(clean_token) < 10:
+        raise AppError(
+            code="TOKEN_INVALID",
+            message="Invalid or malformed reset token.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    token_hash = hash_action_token(clean_token)
+    token_row = await password_reset_repo.get_reset_token_by_hash(session, token_hash)
+
+    if token_row is None:
+        raise AppError(
+            code="TOKEN_INVALID",
+            message="Invalid or malformed reset token.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if token_row.used_at is not None:
+        raise AppError(
+            code="TOKEN_ALREADY_USED",
+            message="This password reset token has already been used.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    now = datetime.now(UTC)
+    expires_at = (
+        token_row.expires_at.replace(tzinfo=UTC)
+        if token_row.expires_at.tzinfo is None
+        else token_row.expires_at
+    )
+
+    if now >= expires_at:
+        raise AppError(
+            code="TOKEN_EXPIRED",
+            message="This password reset token has expired. Please request a new reset link.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    user = await user_repo.get_user_by_id(session, token_row.user_id, for_update=True)
+    if user is None:
+        raise AppError(
+            code="USER_NOT_FOUND",
+            message="User associated with this token was not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    if user.status != "active":
+        if user.status == "suspended":
+            msg = "Account is suspended."
+        elif user.status == "banned":
+            msg = "Account is banned."
+        else:
+            msg = "Account is inactive."
+        raise AppError(
+            code="ACCOUNT_DISABLED",
+            message=msg,
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    # 3. Atomically mark token used enforcing single-use under concurrency
+    marked = await password_reset_repo.mark_token_used(session, token_row.id, now)
+    if not marked:
+        fresh_token = await password_reset_repo.get_reset_token_by_hash(
+            session, token_hash, populate_existing=True
+        )
+        if fresh_token is not None and fresh_token.used_at is not None:
+            raise AppError(
+                code="TOKEN_ALREADY_USED",
+                message="This password reset token has already been used.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if fresh_token is not None and now >= (
+            fresh_token.expires_at.replace(tzinfo=UTC)
+            if fresh_token.expires_at.tzinfo is None
+            else fresh_token.expires_at
+        ):
+            raise AppError(
+                code="TOKEN_EXPIRED",
+                message="This password reset token has expired. Please request a new reset link.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        raise AppError(
+            code="TOKEN_INVALID",
+            message="Invalid or malformed reset token.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # 4. Hash new password with Argon2id and update user credentials
+    new_password_hash = hash_password(new_password)
+    await user_repo.update_user_password(session, user.id, new_password_hash)
+
+    # 5. Invalidate all other outstanding unexpired reset tokens for this user
+    await password_reset_repo.invalidate_user_reset_tokens(session, user.id, now)
+
+    # 6. Global session revocation: revoke all active sessions for this user
+    await session_repo.revoke_all_user_sessions(
+        session=session,
+        user_id=user.id,
+        revoked_at=now,
+        reason="password_reset",
+    )
+
+    # 6. Clear ambient session cookie if present
+    if request is not None and response is not None and settings is not None:
+        if request.cookies.get(settings.session_cookie_name) is not None:
+            response.delete_cookie(
+                key=settings.session_cookie_name,
+                path="/",
+                httponly=True,
+                secure=settings.is_production or (settings.app_env != "development"),
+                samesite="lax",
+            )
+
+    return user

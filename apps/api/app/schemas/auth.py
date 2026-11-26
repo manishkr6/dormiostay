@@ -178,3 +178,40 @@ class VerificationResponse(BaseModel):
 
     status: str = Field(default="ok")
     message: str = Field(..., description="Human-readable result message")
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Payload to request password reset link (T-11)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(..., max_length=255, description="Account email address")
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def strip_email(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not EMAIL_PATTERN.match(cleaned):
+            raise ValueError("Invalid email address format.")
+        return cleaned
+
+
+class ResetPasswordRequest(BaseModel):
+    """Payload to reset account password using an action token (T-11)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(..., min_length=1, max_length=255, description="Password reset action token")
+    new_password: str = Field(
+        ..., min_length=1, max_length=255, description="New plaintext password"
+    )
+
+    @field_validator("token", mode="before")
+    @classmethod
+    def strip_token(cls, value: str) -> str:
+        return value.strip() if isinstance(value, str) else value

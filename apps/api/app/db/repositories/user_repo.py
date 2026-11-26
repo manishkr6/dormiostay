@@ -9,9 +9,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import User, UserProfile
 
 
-async def get_user_by_id(session: AsyncSession, user_id: UUID) -> User | None:
+async def get_user_by_id(
+    session: AsyncSession,
+    user_id: UUID,
+    *,
+    for_update: bool = False,
+) -> User | None:
     """Retrieve user by primary key UUID."""
     stmt = select(User).where(User.id == user_id)
+    if for_update:
+        stmt = stmt.with_for_update()
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
@@ -83,12 +90,20 @@ async def update_login_success(
     session: AsyncSession,
     user_id: UUID,
     login_at: datetime,
-) -> None:
-    """Reset failed login count and record last login timestamp."""
-    stmt = (
-        update(User).where(User.id == user_id).values(failed_login_count=0, last_login_at=login_at)
-    )
-    await session.execute(stmt)
+    expected_password_hash: str | None = None,
+) -> bool:
+    """Reset failed login count and record last login timestamp.
+
+    If expected_password_hash is provided, conditionally updates only if the user's
+    password_hash has not changed during authentication (optimistic concurrency guard against
+    concurrent password reset). Returns True if rowcount == 1, or False if credentials changed.
+    """
+    stmt = update(User).where(User.id == user_id)
+    if expected_password_hash is not None:
+        stmt = stmt.where(User.password_hash == expected_password_hash)
+    stmt = stmt.values(failed_login_count=0, last_login_at=login_at)
+    result = await session.execute(stmt)
+    return int(getattr(result, "rowcount", 0) or 0) == 1
 
 
 async def update_login_failure(
@@ -111,4 +126,22 @@ async def mark_user_email_verified(
 ) -> None:
     """Record email verification timestamp on the user."""
     stmt = update(User).where(User.id == user_id).values(email_verified_at=verified_at)
+    await session.execute(stmt)
+
+
+async def update_user_password(
+    session: AsyncSession,
+    user_id: UUID,
+    new_password_hash: str,
+) -> None:
+    """Update user password hash and reset failed login count (T-11)."""
+    stmt = (
+        update(User)
+        .where(User.id == user_id)
+        .values(
+            password_hash=new_password_hash,
+            failed_login_count=0,
+            locked_until=None,
+        )
+    )
     await session.execute(stmt)
