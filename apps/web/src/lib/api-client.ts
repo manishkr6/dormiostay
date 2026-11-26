@@ -88,6 +88,7 @@ async function request<T>(path: string, options: ApiOptions = {}, csrf = true): 
       const token = await request<unknown>('/auth/csrf', { signal: controller.signal }, false);
       if (!isRecord(token) || typeof token.token !== 'string' || !token.token)
         throw new ApiError(0, 'CSRF_UNAVAILABLE', 'Please refresh the page and try again.');
+      storedCsrfToken = token.token;
       headers.set('X-CSRF-Token', token.token);
     }
     const response = await fetch(url, {
@@ -160,4 +161,28 @@ async function request<T>(path: string, options: ApiOptions = {}, csrf = true): 
     if (slow) notifySlow(-1);
   }
 }
+let storedCsrfToken: string | null = null;
+
+export function getStoredCsrfToken(): string | null {
+  return storedCsrfToken;
+}
+
+export function setStoredCsrfToken(token: string | null): void {
+  storedCsrfToken = token;
+}
+
+export function clearCsrfToken(): void {
+  storedCsrfToken = null;
+}
+
+export async function bootstrapCsrf(signal?: AbortSignal): Promise<string> {
+  const options: ApiOptions = signal ? { signal } : {};
+  const token = await request<unknown>('/auth/csrf', options, false);
+  if (!isRecord(token) || typeof token.token !== 'string' || !token.token) {
+    throw new ApiError(0, 'CSRF_UNAVAILABLE', 'Please refresh the page and try again.');
+  }
+  storedCsrfToken = token.token;
+  return token.token;
+}
+
 export const apiClient = request;

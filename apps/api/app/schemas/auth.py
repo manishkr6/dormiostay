@@ -129,3 +129,9 @@ class StatusResponse(BaseModel):
     """Generic status response."""
 
     status: str = "ok"
+
+
+class CsrfResponse(BaseModel):
+    """CSRF token response payload for Web client."""
+
+    token: str = Field(..., description="CSRF token for state-changing Web requests")

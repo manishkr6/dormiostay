@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import AliasChoices, AnyHttpUrl, Field
+from pydantic import AliasChoices, AnyHttpUrl, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AppEnvironment = Literal["development", "staging", "production"]
@@ -63,9 +63,35 @@ class Settings(BaseSettings):
         default=8, gt=0, description="Absolute session timeout in hours (Admin)"
     )
 
+    # T-07 CSRF & Origin Protection Configuration
+    csrf_protection_enabled: bool = Field(
+        default=True,
+        description="Enable CSRF and Origin protection on state-changing requests",
+    )
+    csrf_secret_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("csrf_secret_key", "CSRF_SECRET", "CSRF_SECRET_KEY"),
+        description="Secret key for signing CSRF tokens; derived from database URL if empty",
+    )
+    csrf_token_expire_seconds: int = Field(
+        default=3600,
+        gt=0,
+        description="Expiration time in seconds for CSRF tokens",
+    )
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
+
+    @model_validator(mode="after")
+    def validate_csrf_secret_for_production(self) -> "Settings":
+        if self.auth_endpoints_enabled and self.app_env in ("production", "staging"):
+            if not self.csrf_secret_key or not self.csrf_secret_key.strip():
+                raise ValueError(
+                    "CSRF_SECRET (csrf_secret_key) must be explicitly configured when "
+                    "authentication endpoints are enabled in production or staging environments."
+                )
+        return self
 
 
 @lru_cache(maxsize=1)

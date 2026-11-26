@@ -77,7 +77,7 @@ def cleanup_patchers() -> Generator[None, None, None]:
         p.stop()
 
 
-def create_test_settings(auth_enabled: bool = True) -> Settings:
+def create_test_settings(auth_enabled: bool = True, csrf_enabled: bool = False) -> Settings:
     """Create settings fixture with predictable configuration for tests."""
     return Settings(  # type: ignore[call-arg]
         _env_file=None,
@@ -85,6 +85,7 @@ def create_test_settings(auth_enabled: bool = True) -> Settings:
         database_url="postgresql+asyncpg://test:test@localhost:5432/neondb",
         frontend_origin=AnyHttpUrl("http://localhost:5173"),
         auth_endpoints_enabled=auth_enabled,
+        csrf_protection_enabled=csrf_enabled,
         session_cookie_name="dormiostay_session",
         session_idle_timeout_minutes=30,
         session_absolute_timeout_days=14,

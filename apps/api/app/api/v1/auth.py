@@ -5,14 +5,24 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.api.deps import get_current_session_and_user, require_auth_endpoints_enabled
+from app.api.deps import (
+    get_current_session_and_user,
+    require_auth_endpoints_enabled,
+    verify_csrf,
+)
 from app.core.config import Settings, get_settings
+from app.core.csrf import (
+    generate_anonymous_csrf_token,
+    generate_session_csrf_token,
+    get_csrf_signing_key,
+)
 from app.core.errors import AppError
 from app.db.models import User, UserSession
 from app.db.session import get_session, get_session_factory
 from app.schemas.auth import (
     AuthResponseNative,
     AuthResponseWeb,
+    CsrfResponse,
     LoginRequest,
     MeResponse,
     ProfileResponse,
@@ -23,8 +33,64 @@ from app.schemas.auth import (
 from app.services import auth_service
 
 router = APIRouter(
-    dependencies=[Depends(require_auth_endpoints_enabled)],
+    dependencies=[Depends(require_auth_endpoints_enabled), Depends(verify_csrf)],
 )
+
+
+@router.get(
+    "/csrf",
+    response_model=CsrfResponse,
+    summary="Obtain a CSRF token for Web state-changing requests",
+)
+async def get_csrf(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    db_session: Annotated[AsyncSession, Depends(get_session)],
+    session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+) -> CsrfResponse:
+    """Provide CSRF token for Web clients.
+
+    - If user has a valid ambient session cookie, issues a session-bound token.
+    - If user is anonymous (no cookie or invalid session), issues an anonymous token.
+    - Rejects mixed credentials (both cookie and Authorization header).
+    """
+    cookie_token = request.cookies.get(settings.session_cookie_name)
+    auth_header = request.headers.get("Authorization")
+    if cookie_token is not None and auth_header is not None:
+        raise AppError(
+            code="AMBIGUOUS_CREDENTIALS",
+            message=(
+                "Ambiguous authentication credentials: both session cookie "
+                "and Authorization header provided."
+            ),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    signing_key = get_csrf_signing_key(settings)
+
+    if cookie_token:
+        try:
+            user_session, _ = await auth_service.validate_session(
+                session=db_session,
+                raw_token=cookie_token.strip(),
+                settings=settings,
+                session_factory=session_factory,
+            )
+            token = generate_session_csrf_token(
+                session_token_hash=user_session.token_hash,
+                secret_key=signing_key,
+                expire_seconds=settings.csrf_token_expire_seconds,
+            )
+            return CsrfResponse(token=token)
+        except Exception:
+            # Expired or invalid session falls back to anonymous bootstrap token
+            pass
+
+    token = generate_anonymous_csrf_token(
+        secret_key=signing_key,
+        expire_seconds=settings.csrf_token_expire_seconds,
+    )
+    return CsrfResponse(token=token)
 
 
 @router.post(

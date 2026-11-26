@@ -1,6 +1,14 @@
 import { act, render, screen } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
-import { apiClient, ApiError, requestActivity } from './api-client';
+import {
+  apiClient,
+  ApiError,
+  bootstrapCsrf,
+  clearCsrfToken,
+  getStoredCsrfToken,
+  requestActivity,
+  setStoredCsrfToken,
+} from './api-client';
 import { WakingBanner } from '../components/ui/waking-banner';
 
 afterEach(() => {
@@ -245,3 +253,34 @@ it.each(
     expect(requestActivity.getSnapshot()).toBe(false);
   },
 );
+
+it('bootstraps, stores, reads, and clears CSRF token in memory without exposing credentials', async () => {
+  const fetcher = vi.fn().mockResolvedValueOnce(json({ token: 'bootstrap-token-xyz' }));
+  vi.stubGlobal('fetch', fetcher);
+
+  clearCsrfToken();
+  expect(getStoredCsrfToken()).toBeNull();
+  const token = await bootstrapCsrf();
+  expect(token).toBe('bootstrap-token-xyz');
+  expect(getStoredCsrfToken()).toBe('bootstrap-token-xyz');
+  expect(fetcher).toHaveBeenCalledWith(
+    '/api/v1/auth/csrf',
+    expect.objectContaining({ credentials: 'include', redirect: 'error' }),
+  );
+
+  clearCsrfToken();
+  expect(getStoredCsrfToken()).toBeNull();
+
+  setStoredCsrfToken('manual-token');
+  expect(getStoredCsrfToken()).toBe('manual-token');
+  clearCsrfToken();
+});
+
+it('rejects bootstrapCsrf if /auth/csrf fails or returns non-record data', async () => {
+  const fetcher = vi.fn().mockResolvedValueOnce(json({ invalid: true }));
+  vi.stubGlobal('fetch', fetcher);
+
+  await expect(bootstrapCsrf()).rejects.toMatchObject({
+    code: 'CSRF_UNAVAILABLE',
+  });
+});

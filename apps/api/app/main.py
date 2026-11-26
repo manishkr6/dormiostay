@@ -46,7 +46,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_origins=[str(resolved_settings.frontend_origin).rstrip("/")],
         allow_credentials=True,
         allow_methods=["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"],
-        allow_headers=["Accept", "Authorization", "Content-Type", "Origin", "X-Request-ID"],
+        allow_headers=[
+            "Accept",
+            "Authorization",
+            "Content-Type",
+            "Origin",
+            "X-Request-ID",
+            "X-CSRF-Token",
+            "X-Client-Type",
+        ],
     )
     register_exception_handlers(application)
     application.include_router(health_router)

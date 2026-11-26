@@ -6,6 +6,7 @@ from fastapi import Depends, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings, get_settings
+from app.core.csrf import verify_csrf as verify_csrf
 from app.core.errors import AppError
 from app.db.models import User, UserSession
 from app.db.session import get_session, get_session_factory
@@ -101,12 +102,16 @@ async def get_current_session_and_user(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> tuple[UserSession, User]:
     """Validate server-side session and establish authenticated request identity."""
-    user_session, user = await auth_service.validate_session(
-        session=db_session,
-        raw_token=raw_token,
-        settings=settings,
-        session_factory=session_factory,
-    )
+    if hasattr(request.state, "user_session") and hasattr(request.state, "user"):
+        user_session = request.state.user_session
+        user = request.state.user
+    else:
+        user_session, user = await auth_service.validate_session(
+            session=db_session,
+            raw_token=raw_token,
+            settings=settings,
+            session_factory=session_factory,
+        )
 
     if user.role not in {"tenant", "owner", "admin"}:
         raise AppError(
