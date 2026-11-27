@@ -136,6 +136,21 @@ Under T-05's zero-table-grant baseline, `dormiostay_app` possesses zero default 
 - **Tier 3: Staging Gates (Gate 4 / Gate 5):**
   - Live execution against Neon Lakebase PostgreSQL (`small-dew-81510029`) during deployment under dual-role procedure.
 
+### 5.2 CI-01 Remediation: GitHub Actions Migration Target Rejection (Run 45953154308)
+- **Incident Summary:** Initial GitHub Actions CI execution for commit `954646ec266f8b202ef88a0b28fcb5151adb30b0` (Workflow Run ID: [45953154308](https://github.com/manishkr6/dormiostay/actions/runs/45953154308)) succeeded on `web` and `mobile` jobs, but the `api` job failed at step `Provision PostgreSQL test roles and run migrations` with `MIGRATION_TARGET_REJECTED`.
+- **Exact Root Cause:**
+  1. `apps/api/alembic/env.py` (line 20) evaluates `direct_url = os.environ.get("DATABASE_URL_DIRECT")`. In CI, only `MIGRATION_URL` and `DATABASE_URL` were passed; without `DATABASE_URL_DIRECT`, `alembic/env.py` aborted immediately.
+  2. `apps/api/app/db/test_target.py` enforces regex `r"dormiostay_t03_test_[a-z0-9_]+"` and requires `TEST_DATABASE_NAME` for local disposable database migration authorization. The CI workflow was configured with database name `dormiostay_test`, which failed validation.
+- **Minimal Correction in `.github/workflows/ci.yml`:**
+  - Standardized the disposable test database name to `dormiostay_t03_test_ci` across `POSTGRES_DB`, health check (`pg_isready -U neondb_owner -d dormiostay_t03_test_ci`), role-provisioning script, and runtime `DATABASE_URL`.
+  - Injected `DATABASE_URL_DIRECT` and `TEST_DATABASE_NAME: dormiostay_t03_test_ci` into the migration step environment, directly satisfying `alembic/env.py` and `migration_guard.py`.
+- **Local Verification:**
+  - Evaluated `resolve_migration_target()` locally against proposed CI URL: successfully validated and resolved to loopback without network.
+  - Executed 87 deployment/migration guard tests in `test_deployment_config.py` and `test_staging_migration_guard.py`: all passed.
+  - Prettier format check and `git diff --check`: clean (0 errors).
+- **PostgreSQL Tests Status:** The 7 live PostgreSQL RLS tests remain pending until re-run on GitHub Actions CI.
+- **Production / Staging Isolation:** Zero changes to staging or production environments; `auth_endpoints_enabled = False` preserved.
+
 ---
 
 ## 6. Verification Results

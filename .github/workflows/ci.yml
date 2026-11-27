@@ -15,16 +15,16 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_DB: dormiostay_test
+          POSTGRES_DB: dormiostay_t03_test_ci
           POSTGRES_USER: neondb_owner
           POSTGRES_PASSWORD: test_owner_password
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U neondb_owner -d dormiostay_t03_test_ci"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
     defaults:
       run:
         working-directory: apps/api
@@ -48,19 +48,20 @@ jobs:
         run: uv run --no-sync mypy
       - name: Provision PostgreSQL test roles and run migrations
         env:
-          MIGRATION_URL: postgresql+asyncpg://neondb_owner:test_owner_password@localhost:5432/dormiostay_test
+          DATABASE_URL_DIRECT: postgresql+asyncpg://neondb_owner:test_owner_password@localhost:5432/dormiostay_t03_test_ci
+          TEST_DATABASE_NAME: dormiostay_t03_test_ci
         run: |
           uv run python -c "
           import asyncio, asyncpg
           async def setup():
-              conn = await asyncpg.connect('postgresql://neondb_owner:test_owner_password@localhost:5432/dormiostay_test')
+              conn = await asyncpg.connect('postgresql://neondb_owner:test_owner_password@localhost:5432/dormiostay_t03_test_ci')
               await conn.execute('''
                   DO \$\$
                   BEGIN
                       IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dormiostay_app') THEN
                           CREATE ROLE dormiostay_app WITH LOGIN PASSWORD 'test_app_password' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
                       END IF;
-                      GRANT CONNECT ON DATABASE dormiostay_test TO dormiostay_app;
+                      GRANT CONNECT ON DATABASE dormiostay_t03_test_ci TO dormiostay_app;
                       GRANT USAGE ON SCHEMA public TO dormiostay_app;
                   END
                   \$\$;
@@ -68,15 +69,16 @@ jobs:
               await conn.close()
           asyncio.run(setup())
           "
-          DATABASE_URL="$MIGRATION_URL" uv run alembic upgrade head
+          uv run alembic upgrade head
       - name: Live PostgreSQL RLS security tests (T-12)
         env:
-          DATABASE_URL: postgresql+asyncpg://dormiostay_app:test_app_password@localhost:5432/dormiostay_test
+          DATABASE_URL: postgresql+asyncpg://dormiostay_app:test_app_password@localhost:5432/dormiostay_t03_test_ci
+          CI: 'true'
           OFFLINE_ONLY: '0'
         run: |
           uv run --no-sync pytest tests/security/test_postgres_rls_integration.py -v
       - name: Unit and security tests (T-12)
-        run: uv run --no-sync pytest
+        run: uv run --no-sync pytest tests/unit tests/security -v
 
   web:
     runs-on: ubuntu-latest
