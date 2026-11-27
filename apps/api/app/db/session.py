@@ -105,25 +105,20 @@ async def set_session_identity(
                 bind = sync_sess.get_bind()
             except Exception:
                 bind = None
+    if bind is None and hasattr(session, "conn"):
+        bind = getattr(session, "conn", None)
 
     if bind is not None and hasattr(bind, "dialect"):
         dialect_name = getattr(bind.dialect, "name", None)
         if isinstance(dialect_name, str) and dialect_name != "postgresql":
             return
 
-    try:
-        await session.execute(
-            text(
-                "SELECT set_config('app.user_id', :user_id, true), "
-                "set_config('app.role', :role, true)"
-            ),
-            {"user_id": str(user_id) if user_id else "", "role": role},
-        )
-    except Exception as exc:
-        err_msg = str(exc).lower()
-        if "set_config" in err_msg or "no such function" in err_msg:
-            return
-        raise
+    await session.execute(
+        text(
+            "SELECT set_config('app.user_id', :user_id, true), set_config('app.role', :role, true)"
+        ),
+        {"user_id": str(user_id) if user_id else "", "role": role},
+    )
 
 
 @asynccontextmanager

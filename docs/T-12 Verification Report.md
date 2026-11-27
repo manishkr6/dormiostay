@@ -4,7 +4,7 @@
 - **Ticket:** T-12 — Role permissions and row-level security
 - **Branch:** `feature/t12-implementation`
 - **Base Commit / Parent HEAD:** `7faaa8984776555e975c52997694b68d00875d0a` (`fix(email): prevent duplicate outbox dispatch from batch lock release`)
-- **Status:** **REMEDIATED & VERIFIED — UNCOMMITTED ON FEATURE BRANCH READY FOR FINAL PRE-COMMIT CLOSURE**
+- **Status:** **T12-FIX-01 INDEPENDENTLY APPROVED BY GEMINI 4 HYDROGEN — READY FOR FINAL SINGLE-COMMIT CLOSURE**
 
 ---
 
@@ -209,6 +209,34 @@ Under T-05's zero-table-grant baseline, `dormiostay_app` possesses zero default 
 - **Status of Live PostgreSQL Tests:** The 7 live PostgreSQL RLS tests remain pending successful remote execution on GitHub Actions.
 - **Production / Staging Isolation:** Zero changes to Neon staging, Render, Brevo, or Upstash; `auth_endpoints_enabled = False` preserved.
 
+### 5.5 T12-FIX-01 Remediation: Session Identity Fail-Closed GUC Error Handling
+- **Incident / Defect Summary:** In `apps/api/app/db/session.py` (`set_session_identity`), a generic `try...except` block caught `Exception` and silently swallowed any error whose message contained `"set_config"` or `"no such function"`. This was originally intended to tolerate SQLite during early testing, but line 109 already checks `dialect_name != "postgresql"`. As a result, on PostgreSQL, any database-level failure during GUC establishment (e.g. invalid arguments, parameter limits, permission failures, or catalog corruption) was silently ignored. The session identity helper returned cleanly, permitting protected transactional operations to execute with unset or stale identity context.
+- **Root Cause:**
+  - Broad exception catching (`except Exception as exc:`) coupled with string-matching (`if "set_config" in err_msg or "no such function" in err_msg: return`).
+  - Failure to let genuine PostgreSQL connection or query errors propagate and fail closed.
+- **Minimal Correction:**
+  1. In `apps/api/app/db/session.py`:
+     - Removed the entire exception-swallowing `try...except` block around `session.execute()`.
+     - Strengthened dialect checking to inspect `session.bind`, `session.get_bind()`, `session.sync_session`, and adapter connections (`hasattr(session, "conn")`). If the dialect is not `"postgresql"`, it cleanly returns (no-op).
+     - On PostgreSQL, `session.execute(text("SELECT set_config(...), set_config(...)"))` executes directly. Any error propagates immediately, causing `transaction()`, `system_transaction()`, and `get_session()` to abort and roll back before any protected operation can execute.
+- **Security Regression Evidence (`apps/api/tests/unit/test_t12_session_identity_fail_closed.py`):**
+  - Added 9 dedicated regression tests:
+    1. `test_set_session_identity_postgres_success`: Verifies correct parameterized execution on PostgreSQL dialect.
+    2. `test_set_session_identity_postgres_generic_failure_propagates`: Verifies generic DB exceptions propagate.
+    3. `test_set_session_identity_failure_mentioning_set_config_cannot_be_swallowed`: Verifies errors mentioning "set_config" are never swallowed.
+    4. `test_set_session_identity_no_such_function_not_swallowed`: Verifies errors mentioning "no such function" propagate on PostgreSQL.
+    5. `test_set_session_identity_sqlite_dialect_noop`: Verifies clean no-op on SQLite dialect without executing SQL.
+    6. `test_set_session_identity_sqlite_adapter_conn_noop`: Verifies clean no-op on connection-wrapping session adapters.
+    7. `test_failed_identity_setup_prevents_protected_operations_in_transaction`: Verifies `transaction()` aborts and never enters the protected body if setup fails.
+    8. `test_failed_identity_setup_prevents_protected_operations_in_system_transaction`: Verifies `system_transaction()` aborts and never enters the system body if setup fails.
+    9. `test_role_and_user_validation_preserved`: Verifies role and user_id validation remains fully active and enforced.
+- **Residual Custom GUC Trust-Boundary Limitation:**
+  - In Lakebase PostgreSQL, custom GUCs (`app.user_id`, `app.role`) are transaction-local session variables set via `set_config(..., true)`. Because `dormiostay_app` is the single connection role, an attacker with arbitrary SQL injection capability could theoretically call `set_config('app.role', 'admin', true)`.
+  - Defense-in-depth mitigations: strict query parameterization with `hide_parameters=True`, application-level role restriction in `get_session` refusing `system`/`worker` from HTTP requests, and the `protect_users_sensitive_columns` database trigger preventing tenants from modifying sensitive columns.
+- **Status of Live PostgreSQL Tests:** The 7 live PostgreSQL RLS tests were verified passing in GitHub Actions CI run `46011543587` and remain pending remote execution for the commit containing T12-FIX-01.
+- **Independent Security Review Approval:** Gemini 4 Hydrogen completed a strictly read-only security audit of T12-FIX-01 and formally issued **`APPROVED — T12-FIX-01 READY FOR ONE LOCAL COMMIT`** on 2026-11-27.
+- **Production / Staging Isolation:** Zero changes to Neon staging, Render, Brevo, or Upstash; `auth_endpoints_enabled = False` preserved.
+
 ---
 
 ## 6. Verification Results
@@ -217,19 +245,20 @@ All local verification suites were executed:
 
 | Test / Check Suite | Target Command | Result |
 |:---|:---|:---:|
+| **T12-FIX-01 Regression Suite** | `pytest apps/api/tests/unit/test_t12_session_identity_fail_closed.py` | **9 passed** |
 | **CI-02-SEC-01 Regression Suite** | `pytest apps/api/tests/unit/test_t12_ci_database_env.py` | **13 passed, 1 warning** |
 | **Security Test Suite** | `pytest apps/api/tests/security` | **58 passed, 7 skipped, 1 warning** |
 | **T-05 Staging Gate Suite** | `pytest apps/api/tests/unit/test_t05*` | **88 passed** |
 | **T-05 Guard Suite** | `pytest apps/api/tests/unit/test_deployment_config.py ...` | **129 passed, 15 warnings** |
 | **Auth Regressions (T-06..T-11)** | `pytest apps/api/tests/unit/test_t06* .. test_t11*` | **205 passed, 1 warning** |
-| **Full Backend Offline Suite** | `pytest apps/api/tests/unit apps/api/tests/security` | **715 passed, 7 skipped, 15 warnings** |
+| **Full Backend Offline Suite** | `pytest apps/api/tests/unit apps/api/tests/security` | **724 passed, 7 skipped, 15 warnings** |
 | **Frontend Web Tests** | `pnpm --filter @dormiostay/web test` | **84 passed** |
 | **Frontend Mobile Tests** | `pnpm --filter @dormiostay/mobile test` | **88 passed** |
 | **Frontend Web Build** | `pnpm --filter @dormiostay/web build` | **Success (dist/index.html)** |
 | **Mobile Config Check** | `npm run config:mobile` | **All Expo variants verified** |
-| **Python Ruff Lint** | `ruff check apps/api` | **Clean (0 errors across 71 files)** |
-| **Python Ruff Format** | `ruff format --check apps/api` | **Clean (71 files formatted)** |
-| **Strict Mypy Typecheck** | `mypy apps/api` | **Success: 0 errors across 67 source files** |
+| **Python Ruff Lint** | `ruff check apps/api` | **Clean (0 errors across 72 files)** |
+| **Python Ruff Format** | `ruff format --check apps/api` | **Clean (72 files formatted)** |
+| **Strict Mypy Typecheck** | `mypy apps/api` | **Success: 0 errors across 68 source files** |
 | **Prettier Formatting** | `npm run format:check` | **Clean (All matched files use Prettier code style)** |
 | **Git Whitespace Check** | `git diff --check` | **Clean (0 errors)** |
 
@@ -237,7 +266,10 @@ All local verification suites were executed:
 
 ## 7. Staging Gate Status & External Dependencies
 
-1. **Gate 4 / Gate 5 Status:** Migration `0003_row_level_security.py` has **NOT** been executed against the Neon staging database (`small-dew-81510029`). In accordance with DevSecOps rules, migration execution occurs only during Gate 4 deployment under the approved migration runner role (`neondb_owner`).
+1. **Gate Closure & Readiness Status:**
+   - **Historical T-05 Gate 4:** APPROVED by Astra.
+   - **Neon Staging Migration:** **BLOCKED** pending implementation of incremental upgrade guard (`0001` -> `0003`), pre-T-12 snapshot creation, and Astra re-approval.
+   - **Render Staging Deployment:** **BLOCKED** pending staging API destination verification and successful database migration.
 2. **Feature Ticket Dependencies:**
    - **T-13 (TOTP Admin MFA):** Admin MFA enforcement will be completed when T-13 provides trusted server-side MFA verification (`request.state.mfa_completed = True`).
    - **T-16 (Host Application & Onboarding):** Full host application status checks will be connected when T-16 creates the `host_applications` table.
@@ -248,14 +280,12 @@ All local verification suites were executed:
 ## 8. Git Inventory & Review Baseline
 
 - **Active Branch:** `feature/t12-implementation`
-- **Starting Remote Commit (HEAD):** `044775cf4f7c02f559aea75fac9d9e105279dcd9`
-- **Working Tree Inventory (CI-02 + CI-02-SEC-01 remediation):**
-  - Tracked modifications (4):
-    - `.github/workflows/ci.yml`
-    - `apps/api/tests/conftest.py`
-    - `apps/api/tests/security/test_postgres_rls_integration.py`
+- **Starting Remote Commit (HEAD):** `34841f55ac28e09ddc4d0208cb937a15b0815815`
+- **Working Tree Inventory (T12-FIX-01 remediation):**
+  - Tracked modifications (2):
+    - `apps/api/app/db/session.py`
     - `docs/T-12 Verification Report.md`
   - Untracked files (1):
-    - `apps/api/tests/unit/test_t12_ci_database_env.py`
+    - `apps/api/tests/unit/test_t12_session_identity_fail_closed.py`
 - **Staged Changes:** `0` staged files.
-- **Commits Created:** `0` new commits. All changes remain strictly **UNCOMMITTED** for final independent review.
+- **Commits Created:** `0` new commits. All changes remain strictly **UNCOMMITTED** for independent review.
