@@ -26,6 +26,7 @@ from app.db.repositories import (
     user_repo,
     verification_repo,
 )
+from app.db.session import set_session_identity
 from app.schemas.auth import LoginRequest, SignupRequest
 from app.services import email_service
 
@@ -47,6 +48,9 @@ async def signup(
             message="Public registration is limited to tenant and owner roles only.",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+    # Establish trusted internal system context for registration under RLS
+    await set_session_identity(session, role="system")
 
     # 2. Validate password strength
     is_valid, err_msg = validate_password_strength(payload.password)
@@ -179,6 +183,9 @@ async def login(
     if session_factory is None:
         raise RuntimeError("SESSION_FACTORY_REQUIRED")
 
+    # Establish trusted internal system context for user credential lookup under RLS
+    await set_session_identity(session, role="system")
+
     # 1. Lookup user by email (case-insensitive)
     user = await user_repo.get_user_by_email_ci(session, payload.email)
     if user is None:
@@ -193,6 +200,7 @@ async def login(
     # 2. Verify password (fail-safe and persist failed attempt counter in independent transaction)
     if not verify_password(payload.password, user.password_hash):
         async with session_factory() as sec_session, sec_session.begin():
+            await set_session_identity(sec_session, role="system")
             await user_repo.update_login_failure(sec_session, user.id)
         raise AppError(
             code="AUTHENTICATION_FAILED",
@@ -303,6 +311,9 @@ async def validate_session(
     if session_factory is None:
         raise RuntimeError("SESSION_FACTORY_REQUIRED")
 
+    # Establish trusted internal system context for user credential lookup under RLS
+    await set_session_identity(session, role="system")
+
     token_hash = hash_session_token(raw_token)
     session_row = await session_repo.get_session_with_user_by_token_hash(session, token_hash)
 
@@ -340,6 +351,7 @@ async def validate_session(
     # 2. Check absolute expiry (persist revocation in independent transaction before raising)
     if now >= abs_expires:
         async with session_factory() as sec_session, sec_session.begin():
+            await set_session_identity(sec_session, role="system")
             await session_repo.revoke_session(
                 sec_session, user_session.id, now, reason="absolute_expiry"
             )
@@ -352,6 +364,7 @@ async def validate_session(
     # 3. Check idle expiry (persist revocation in independent transaction before raising)
     if now >= idle_expires:
         async with session_factory() as sec_session, sec_session.begin():
+            await set_session_identity(sec_session, role="system")
             await session_repo.revoke_session(
                 sec_session, user_session.id, now, reason="idle_expiry"
             )
@@ -405,6 +418,7 @@ async def validate_session(
 
 async def logout(session: AsyncSession, session_id: UUID) -> None:
     """Revoke the current server session immediately."""
+    await set_session_identity(session, role="system")
     now = datetime.now(UTC)
     await session_repo.revoke_session(session, session_id, now, reason="logout")
 
@@ -415,6 +429,7 @@ async def revoke_all_sessions(
     reason: str,
 ) -> int:
     """Revoke all active sessions for a user (e.g. password reset, suspension, ban)."""
+    await set_session_identity(session, role="system")
     now = datetime.now(UTC)
     return await session_repo.revoke_all_user_sessions(session, user_id, now, reason)
 
@@ -442,6 +457,7 @@ async def verify_email(
     - If account disabled/suspended/banned: raises ACCOUNT_DISABLED (HTTP 403).
     - On success: marks token used and records email_verified_at.
     """
+    await set_session_identity(session, role="system")
     clean_token = token.strip()
     if not clean_token or len(clean_token) < 10:
         raise AppError(
@@ -556,6 +572,7 @@ async def resend_verification(
       - Creates a new random token with 24-hour expiry.
       - Queues verification email in outbox.
     """
+    await set_session_identity(session, role="system")
     clean_email = email.strip().lower()
     user = await user_repo.get_user_by_email_ci(session, clean_email)
 
@@ -617,6 +634,7 @@ async def forgot_password(
       - Creates a new random single-use token with 30-minute expiry.
       - Queues password reset email in outbox.
     """
+    await set_session_identity(session, role="system")
     clean_email = email.strip().lower()
     user = await user_repo.get_user_by_email_ci(session, clean_email)
 
@@ -671,6 +689,7 @@ async def reset_password(
     - A successful reset revokes EVERY session of that user globally.
     - Ambient session cookie is cleared if present in response.
     """
+    await set_session_identity(session, role="system")
     # 1. Validate new password strength upfront
     is_valid, msg = validate_password_strength(new_password)
     if not is_valid:

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.db.models.email_outbox import EmailOutbox
+from app.db.session import set_session_identity
 from app.services.email_service import (
     BrevoAuthError,
     BrevoPermanentError,
@@ -189,6 +190,7 @@ async def process_outbox_batch(
                             bind = None
 
                     if bind and hasattr(bind, "dialect") and bind.dialect.name == "postgresql":
+                        await set_session_identity(session, role="worker")
                         stmt = stmt.with_for_update(skip_locked=True)
 
                     result = await session.execute(stmt)

@@ -11,6 +11,20 @@ jobs:
   api:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: dormiostay_test
+          POSTGRES_USER: neondb_owner
+          POSTGRES_PASSWORD: test_owner_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: apps/api
@@ -32,7 +46,36 @@ jobs:
           uv run --no-sync ruff format --check .
       - name: Check types
         run: uv run --no-sync mypy
-      - name: Test
+      - name: Provision PostgreSQL test roles and run migrations
+        env:
+          MIGRATION_URL: postgresql+asyncpg://neondb_owner:test_owner_password@localhost:5432/dormiostay_test
+        run: |
+          uv run python -c "
+          import asyncio, asyncpg
+          async def setup():
+              conn = await asyncpg.connect('postgresql://neondb_owner:test_owner_password@localhost:5432/dormiostay_test')
+              await conn.execute('''
+                  DO \$\$
+                  BEGIN
+                      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dormiostay_app') THEN
+                          CREATE ROLE dormiostay_app WITH LOGIN PASSWORD 'test_app_password' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                      END IF;
+                      GRANT CONNECT ON DATABASE dormiostay_test TO dormiostay_app;
+                      GRANT USAGE ON SCHEMA public TO dormiostay_app;
+                  END
+                  \$\$;
+              ''')
+              await conn.close()
+          asyncio.run(setup())
+          "
+          DATABASE_URL="$MIGRATION_URL" uv run alembic upgrade head
+      - name: Live PostgreSQL RLS security tests (T-12)
+        env:
+          DATABASE_URL: postgresql+asyncpg://dormiostay_app:test_app_password@localhost:5432/dormiostay_test
+          OFFLINE_ONLY: '0'
+        run: |
+          uv run --no-sync pytest tests/security/test_postgres_rls_integration.py -v
+      - name: Unit and security tests (T-12)
         run: uv run --no-sync pytest
 
   web:

@@ -121,14 +121,9 @@ async def get_current_session_and_user(
         )
 
     # Establish transaction-local PostgreSQL RLS identity context
-    from sqlalchemy import text
+    from app.db.session import set_session_identity
 
-    await db_session.execute(
-        text(
-            "SELECT set_config('app.user_id', :user_id, true), set_config('app.role', :role, true)"
-        ),
-        {"user_id": str(user.id), "role": user.role},
-    )
+    await set_session_identity(db_session, role=user.role, user_id=user.id)
 
     # Propagate trusted identity onto request state for downstream RLS and logging
     request.state.user_id = user.id
