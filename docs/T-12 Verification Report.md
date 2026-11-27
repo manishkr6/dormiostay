@@ -151,6 +151,64 @@ Under T-05's zero-table-grant baseline, `dormiostay_app` possesses zero default 
 - **PostgreSQL Tests Status:** The 7 live PostgreSQL RLS tests remain pending until re-run on GitHub Actions CI.
 - **Production / Staging Isolation:** Zero changes to staging or production environments; `auth_endpoints_enabled = False` preserved.
 
+### 5.3 CI-02 Remediation: Pytest Environment Overwrite in Live PostgreSQL RLS Suite (Run 45956134746)
+- **Incident Summary:** GitHub Actions CI execution for commit `044775cf4f7c02f559aea75fac9d9e105279dcd9` (Workflow Run ID: [45956134746](https://github.com/manishkr6/dormiostay/actions/runs/45956134746)) verified the CI-01 fix:
+  - `web` job passed cleanly (lint, typecheck, 84 Vitest tests, Vite build).
+  - `mobile` job passed cleanly (lint, typecheck, 88 Jest tests, Expo config).
+  - `api` job: PostgreSQL 16 container initialized successfully; Ruff and Mypy passed; role provisioning and Alembic migrations `0001_foundation` → `0002_email_outbox` → `0003_row_level_security` completed with exit code 0.
+  - However, step `Live PostgreSQL RLS security tests (T-12)` failed during pytest collection with exit code 2:
+    `ERROR tests/security/test_postgres_rls_integration.py - Failed: Live PostgreSQL RLS tests required in CI environment with OFFLINE_ONLY=0, but DATABASE_URL is missing or does not target PostgreSQL.`
+- **Exact Root Cause:**
+  - `apps/api/tests/conftest.py` line 8 unconditionally assigned `os.environ["DATABASE_URL"] = "not-used-by-unit-tests"`.
+  - When pytest initialized and loaded `tests/conftest.py`, this unconditional assignment overwrote the live connection string passed by the CI workflow step: `DATABASE_URL: postgresql+asyncpg://dormiostay_app:test_app_password@localhost:5432/dormiostay_t03_test_ci`.
+  - When `tests/security/test_postgres_rls_integration.py` was subsequently imported, `is_live_postgres()` evaluated `DATABASE_URL` as `"not-used-by-unit-tests"`, causing `is_live_postgres()` to return `False`.
+  - The fail-closed CI guard (`if CI == "true" and OFFLINE_ONLY == "0" and not is_live_postgres(): pytest.fail(...)`) tripped immediately as designed to prevent silent skipping of live tests.
+- **Minimal Correction:**
+  - In `apps/api/tests/conftest.py`, changed line 8 from:
+    `os.environ["DATABASE_URL"] = "not-used-by-unit-tests"`
+    to:
+    `os.environ.setdefault("DATABASE_URL", "not-used-by-unit-tests")`
+  - This safely preserves the offline default `"not-used-by-unit-tests"` for unit and security suites while permitting CI and live environments to inject a real disposable PostgreSQL target.
+- **New Regression Suite (`apps/api/tests/unit/test_t12_ci_database_env.py`):**
+  - Added 7 focused tests:
+    1. `test_conftest_safe_offline_default`: Without ambient `DATABASE_URL`, offline default is retained.
+    2. `test_conftest_preserves_supplied_disposable_database_url`: Supplied disposable URL is preserved.
+    3. `test_conftest_subprocess_preserves_ambient_database_url`: Full subprocess collection with ambient `DATABASE_URL` collects all 7 live tests.
+    4. `test_ci_mode_invalid_or_missing_postgres_fails_closed`: Empty or offline `DATABASE_URL` in CI mode fails closed during collection.
+    5. `test_is_live_postgres_logic`: Verifies boolean detection matrix across offline, live, and invalid dialects.
+    6. `test_unit_tests_isolated_fixtures_no_db_connection`: Unit tests execute with isolated fixtures and no database connections.
+    7. `test_disposable_target_validator_rejects_staging_and_production_urls`: `validate_test_url` rejects staging hosts, production hosts, and non-disposable database names.
+- **Status of Live PostgreSQL Tests:** The 7 live PostgreSQL RLS tests remain pending successful remote execution on GitHub Actions.
+- **Production / Staging Isolation:** Zero changes to Neon staging, Render, Brevo, or Upstash; `auth_endpoints_enabled = False` preserved.
+
+### 5.4 CI-02-SEC-01 Remediation: Disposable Database Target Policy Enforcement in Live RLS Harness
+- **Incident Summary:** During independent Hydrogen security review of CI-02, a security blocker was reported:
+  - Finding `CI-02-SEC-01`: The live PostgreSQL RLS test harness (`test_postgres_rls_integration.py`) checked only whether `DATABASE_URL` contained `"postgres"`, without invoking disposable-target validation (`validate_test_url`).
+  - An arbitrary remote staging or production URL could pass `is_live_postgres() == True` and execute data mutation SQL directly against non-disposable environments.
+- **Root Cause:**
+  - `test_postgres_rls_integration.py` was not wired to `app.db.test_target.validate_test_url`.
+  - Step `Live PostgreSQL RLS security tests (T-12)` in `.github/workflows/ci.yml` lacked `TEST_DATABASE_NAME: dormiostay_t03_test_ci`.
+- **Minimal Correction:**
+  1. Integrated `app.db.test_target.validate_test_url` into `test_postgres_rls_integration.py`:
+     - Defined `validate_rls_test_target()` requiring explicit `TEST_DATABASE_NAME` matching `r"dormiostay_t03_test_[a-z0-9_]+"`.
+     - Validates host is loopback (`127.0.0.1`, `localhost`, `::1`) canonicalized to literal IP.
+     - Rejects remote hosts, Neon staging URLs, production URLs, and query parameter overrides before engine creation.
+     - Defined `live_database_url` test fixture supplying the canonicalized URL string to all 7 live test functions.
+     - Fails closed in mandatory CI mode (`CI="true"`, `OFFLINE_ONLY="0"`) if validation fails for any reason.
+     - Cleanly skips in offline mode (`OFFLINE_ONLY="1"` or offline default URL).
+  2. Updated `.github/workflows/ci.yml`:
+     - Added `TEST_DATABASE_NAME: dormiostay_t03_test_ci` to the `Live PostgreSQL RLS security tests (T-12)` step.
+- **Security Regression Evidence (`test_t12_ci_database_env.py`):**
+  - Expanded regression suite to 13 tests covering:
+    - Valid localhost disposable target acceptance and loopback canonicalization.
+    - Rejection of remote Neon staging URLs and remote production URLs.
+    - Rejection of mismatched or missing `TEST_DATABASE_NAME`.
+    - Mandatory CI mode collection failure (exit code 2) on staging target or missing configuration.
+    - Structural verification that all 7 live RLS tests consume `live_database_url` fixture.
+    - Verification that unit tests remain completely offline with isolated mock fixtures.
+- **Status of Live PostgreSQL Tests:** The 7 live PostgreSQL RLS tests remain pending successful remote execution on GitHub Actions.
+- **Production / Staging Isolation:** Zero changes to Neon staging, Render, Brevo, or Upstash; `auth_endpoints_enabled = False` preserved.
+
 ---
 
 ## 6. Verification Results
@@ -159,17 +217,19 @@ All local verification suites were executed:
 
 | Test / Check Suite | Target Command | Result |
 |:---|:---|:---:|
+| **CI-02-SEC-01 Regression Suite** | `pytest apps/api/tests/unit/test_t12_ci_database_env.py` | **13 passed, 1 warning** |
 | **Security Test Suite** | `pytest apps/api/tests/security` | **58 passed, 7 skipped, 1 warning** |
 | **T-05 Staging Gate Suite** | `pytest apps/api/tests/unit/test_t05*` | **88 passed** |
+| **T-05 Guard Suite** | `pytest apps/api/tests/unit/test_deployment_config.py ...` | **129 passed, 15 warnings** |
 | **Auth Regressions (T-06..T-11)** | `pytest apps/api/tests/unit/test_t06* .. test_t11*` | **205 passed, 1 warning** |
-| **Full API Unit Suite** | `pytest apps/api/tests/unit` | **702 passed, 11 skipped, 15 warnings** |
+| **Full Backend Offline Suite** | `pytest apps/api/tests/unit apps/api/tests/security` | **715 passed, 7 skipped, 15 warnings** |
 | **Frontend Web Tests** | `pnpm --filter @dormiostay/web test` | **84 passed** |
 | **Frontend Mobile Tests** | `pnpm --filter @dormiostay/mobile test` | **88 passed** |
 | **Frontend Web Build** | `pnpm --filter @dormiostay/web build` | **Success (dist/index.html)** |
 | **Mobile Config Check** | `npm run config:mobile` | **All Expo variants verified** |
-| **Python Ruff Lint** | `ruff check apps/api` | **Clean (0 errors)** |
-| **Python Ruff Format** | `ruff format --check apps/api` | **Clean (0 issues)** |
-| **Strict Mypy Typecheck** | `mypy apps/api/app` | **Success: 0 errors across 39 source files** |
+| **Python Ruff Lint** | `ruff check apps/api` | **Clean (0 errors across 71 files)** |
+| **Python Ruff Format** | `ruff format --check apps/api` | **Clean (71 files formatted)** |
+| **Strict Mypy Typecheck** | `mypy apps/api` | **Success: 0 errors across 67 source files** |
 | **Prettier Formatting** | `npm run format:check` | **Clean (All matched files use Prettier code style)** |
 | **Git Whitespace Check** | `git diff --check` | **Clean (0 errors)** |
 
@@ -188,18 +248,14 @@ All local verification suites were executed:
 ## 8. Git Inventory & Review Baseline
 
 - **Active Branch:** `feature/t12-implementation`
-- **Base Commit (HEAD):** `7faaa8984776555e975c52997694b68d00875d0a`
-- **Working Tree Inventory:**
-  - Tracked modifications (5):
+- **Starting Remote Commit (HEAD):** `044775cf4f7c02f559aea75fac9d9e105279dcd9`
+- **Working Tree Inventory (CI-02 + CI-02-SEC-01 remediation):**
+  - Tracked modifications (4):
     - `.github/workflows/ci.yml`
-    - `apps/api/app/api/deps.py`
-    - `apps/api/app/db/session.py`
-    - `apps/api/app/services/auth_service.py`
-    - `apps/api/app/services/email_worker.py`
-  - Untracked files (4):
-    - `apps/api/alembic/versions/0003_row_level_security.py`
-    - `apps/api/app/core/permissions.py`
-    - `apps/api/tests/security/` (6 files)
+    - `apps/api/tests/conftest.py`
+    - `apps/api/tests/security/test_postgres_rls_integration.py`
     - `docs/T-12 Verification Report.md`
+  - Untracked files (1):
+    - `apps/api/tests/unit/test_t12_ci_database_env.py`
 - **Staged Changes:** `0` staged files.
 - **Commits Created:** `0` new commits. All changes remain strictly **UNCOMMITTED** for final independent review.

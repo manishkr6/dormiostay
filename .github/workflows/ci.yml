@@ -73,6 +73,7 @@ jobs:
       - name: Live PostgreSQL RLS security tests (T-12)
         env:
           DATABASE_URL: postgresql+asyncpg://dormiostay_app:test_app_password@localhost:5432/dormiostay_t03_test_ci
+          TEST_DATABASE_NAME: dormiostay_t03_test_ci
           CI: 'true'
           OFFLINE_ONLY: '0'
         run: |

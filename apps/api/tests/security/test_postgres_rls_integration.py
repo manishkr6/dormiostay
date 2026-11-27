@@ -20,27 +20,54 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.engine import URL
 from sqlalchemy.exc import DBAPIError, IntegrityError, ProgrammingError
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from app.db.test_target import validate_test_url
+
+
+def validate_rls_test_target() -> URL:
+    """Validate that DATABASE_URL targets an approved local disposable PostgreSQL database.
+
+    Enforces:
+    - Explicit, non-empty TEST_DATABASE_NAME matching r"dormiostay_t03_test_[a-z0-9_]+".
+    - DATABASE_URL database matches TEST_DATABASE_NAME.
+    - Host is strictly loopback (localhost, 127.0.0.1, ::1) canonicalized to literal IP.
+    - Rejects remote hosts, Neon staging, production, and connection overrides.
+
+    Raises ValueError if validation fails.
+    """
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url or db_url == "not-used-by-unit-tests":
+        raise ValueError("DATABASE_URL is not configured for live PostgreSQL testing")
+    approved = os.environ.get("TEST_DATABASE_NAME")
+    if not approved:
+        raise ValueError("TEST_DATABASE_NAME is required for live PostgreSQL testing")
+    return validate_test_url(db_url, approved)
+
 
 def is_live_postgres() -> bool:
-    """Detect whether a live PostgreSQL connection URL is configured and accessible."""
-    db_url = os.environ.get("DATABASE_URL", "")
-    return "postgres" in db_url and not os.environ.get("OFFLINE_ONLY", "1") == "1"
+    """Detect whether a valid live disposable PostgreSQL target is configured and accessible."""
+    if os.environ.get("OFFLINE_ONLY", "1") == "1":
+        return False
+    try:
+        validate_rls_test_target()
+        return True
+    except (ValueError, Exception):
+        return False
 
 
 # In CI when OFFLINE_ONLY is explicitly disabled ("0"),
 # live PostgreSQL tests MUST NOT silently skip.
-if (
-    os.environ.get("CI") == "true"
-    and os.environ.get("OFFLINE_ONLY") == "0"
-    and not is_live_postgres()
-):
-    pytest.fail(
-        "Live PostgreSQL RLS tests required in CI environment with OFFLINE_ONLY=0, "
-        "but DATABASE_URL is missing or does not target PostgreSQL."
-    )
+if os.environ.get("CI") == "true" and os.environ.get("OFFLINE_ONLY") == "0":
+    try:
+        validate_rls_test_target()
+    except Exception as exc:
+        pytest.fail(
+            f"Live PostgreSQL RLS tests required in CI environment with OFFLINE_ONLY=0, "
+            f"but database target validation failed: {exc}"
+        )
 
 pytestmark = pytest.mark.skipif(
     not is_live_postgres(),
@@ -51,11 +78,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture
+def live_database_url() -> str:
+    """Return validated canonical disposable database URL string for live RLS tests."""
+    return validate_rls_test_target().render_as_string(hide_password=False)
+
+
 @pytest.mark.anyio
-async def test_postgres_rls_cross_user_read_blocked() -> None:
+async def test_postgres_rls_cross_user_read_blocked(live_database_url: str) -> None:
     """Verify User A cannot SELECT User B's protected user row in live PostgreSQL."""
-    db_url = os.environ["DATABASE_URL"]
-    engine = create_async_engine(db_url)
+    engine = create_async_engine(live_database_url)
     user_a_id = uuid4()
     user_b_id = uuid4()
 
@@ -78,10 +110,9 @@ async def test_postgres_rls_cross_user_read_blocked() -> None:
 
 
 @pytest.mark.anyio
-async def test_postgres_rls_no_context_returns_zero_rows() -> None:
+async def test_postgres_rls_no_context_returns_zero_rows(live_database_url: str) -> None:
     """Verify that queries with no transaction-local context return zero protected rows."""
-    db_url = os.environ["DATABASE_URL"]
-    engine = create_async_engine(db_url)
+    engine = create_async_engine(live_database_url)
 
     async with engine.connect() as conn:
         # Reset any ambient context
@@ -94,10 +125,9 @@ async def test_postgres_rls_no_context_returns_zero_rows() -> None:
 
 
 @pytest.mark.anyio
-async def test_postgres_rls_missing_context_users_insert_denied() -> None:
+async def test_postgres_rls_missing_context_users_insert_denied(live_database_url: str) -> None:
     """Verify missing context cannot insert into users table (T12-SEC-06)."""
-    db_url = os.environ["DATABASE_URL"]
-    engine = create_async_engine(db_url)
+    engine = create_async_engine(live_database_url)
     uid = uuid4()
 
     async with engine.connect() as conn:
@@ -115,10 +145,9 @@ async def test_postgres_rls_missing_context_users_insert_denied() -> None:
 
 
 @pytest.mark.anyio
-async def test_postgres_rls_guest_context_admin_creation_denied() -> None:
+async def test_postgres_rls_guest_context_admin_creation_denied(live_database_url: str) -> None:
     """Verify guest role cannot insert into users table or create admins (T12-SEC-06)."""
-    db_url = os.environ["DATABASE_URL"]
-    engine = create_async_engine(db_url)
+    engine = create_async_engine(live_database_url)
     uid = uuid4()
 
     async with engine.connect() as conn:
@@ -138,10 +167,11 @@ async def test_postgres_rls_guest_context_admin_creation_denied() -> None:
 
 
 @pytest.mark.anyio
-async def test_postgres_rls_missing_context_email_outbox_insert_denied() -> None:
+async def test_postgres_rls_missing_context_email_outbox_insert_denied(
+    live_database_url: str,
+) -> None:
     """Verify unauthenticated/missing context cannot insert into email_outbox (T12-SEC-07)."""
-    db_url = os.environ["DATABASE_URL"]
-    engine = create_async_engine(db_url)
+    engine = create_async_engine(live_database_url)
 
     async with engine.connect() as conn:
         await conn.execute(
@@ -157,10 +187,11 @@ async def test_postgres_rls_missing_context_email_outbox_insert_denied() -> None
 
 
 @pytest.mark.anyio
-async def test_postgres_rls_guest_context_email_outbox_insert_denied() -> None:
+async def test_postgres_rls_guest_context_email_outbox_insert_denied(
+    live_database_url: str,
+) -> None:
     """Verify guest context cannot insert into email_outbox (T12-SEC-07)."""
-    db_url = os.environ["DATABASE_URL"]
-    engine = create_async_engine(db_url)
+    engine = create_async_engine(live_database_url)
 
     async with engine.connect() as conn:
         await conn.execute(
@@ -178,10 +209,9 @@ async def test_postgres_rls_guest_context_email_outbox_insert_denied() -> None:
 
 
 @pytest.mark.anyio
-async def test_postgres_rls_tenant_cannot_elevate_role() -> None:
+async def test_postgres_rls_tenant_cannot_elevate_role(live_database_url: str) -> None:
     """Verify tenant cannot update own role to admin via trigger enforcement (T12-SEC-08)."""
-    db_url = os.environ["DATABASE_URL"]
-    engine = create_async_engine(db_url)
+    engine = create_async_engine(live_database_url)
     uid = uuid4()
 
     async with engine.connect() as conn:
