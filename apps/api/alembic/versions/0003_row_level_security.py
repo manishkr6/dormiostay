@@ -288,39 +288,54 @@ UPGRADE_STATEMENTS = [
     """CREATE POLICY audit_logs_insert ON audit_logs FOR INSERT
     WITH CHECK (current_setting('app.role', true) IN ('admin', 'system'))""",
     # -------------------------------------------------------------------------
-    # 13. Least-privilege runtime grants for dormiostay_app (T-12 / T-05)
+    # 13. Least-privilege runtime grants for dormiostay_app (T-12 / T-05 / T12-FIX-02)
     # -------------------------------------------------------------------------
     """DO $$
+DECLARE
+    r RECORD;
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dormiostay_app') THEN
-        -- users: SELECT, INSERT, UPDATE (DELETE denied: soft status only)
-        GRANT SELECT, INSERT, UPDATE ON users TO dormiostay_app;
+    SELECT rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls
+    INTO r
+    FROM pg_roles
+    WHERE rolname = 'dormiostay_app';
 
-        -- user_profiles: SELECT, INSERT, UPDATE (DELETE denied)
-        GRANT SELECT, INSERT, UPDATE ON user_profiles TO dormiostay_app;
-
-        -- user_sessions: SELECT, INSERT, UPDATE, DELETE (session lifecycle & cleanup)
-        GRANT SELECT, INSERT, UPDATE, DELETE ON user_sessions TO dormiostay_app;
-
-        -- email_verification_tokens: SELECT, INSERT, UPDATE, DELETE
-        GRANT SELECT, INSERT, UPDATE, DELETE ON email_verification_tokens TO dormiostay_app;
-
-        -- password_reset_tokens: SELECT, INSERT, UPDATE, DELETE
-        GRANT SELECT, INSERT, UPDATE, DELETE ON password_reset_tokens TO dormiostay_app;
-
-        -- email_outbox: SELECT, INSERT, UPDATE, DELETE
-        GRANT SELECT, INSERT, UPDATE, DELETE ON email_outbox TO dormiostay_app;
-
-        -- Public dictionary & catalog tables: SELECT only (read-only for application)
-        GRANT SELECT ON locations TO dormiostay_app;
-        GRANT SELECT ON institutions TO dormiostay_app;
-        GRANT SELECT ON amenities TO dormiostay_app;
-        GRANT SELECT ON property_categories TO dormiostay_app;
-        GRANT SELECT ON platform_settings TO dormiostay_app;
-
-        -- audit_logs: SELECT, INSERT only (UPDATE and DELETE strictly forbidden - immutable log)
-        GRANT SELECT, INSERT ON audit_logs TO dormiostay_app;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Required application role "dormiostay_app" does not exist'
+            USING ERRCODE = '42704';
     END IF;
+
+    IF r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls THEN
+        RAISE EXCEPTION 'Application role "dormiostay_app" possesses forbidden elevated attributes'
+            USING ERRCODE = '42501';
+    END IF;
+
+    -- users: SELECT, INSERT, UPDATE (DELETE denied: soft status only)
+    GRANT SELECT, INSERT, UPDATE ON users TO dormiostay_app;
+
+    -- user_profiles: SELECT, INSERT, UPDATE (DELETE denied)
+    GRANT SELECT, INSERT, UPDATE ON user_profiles TO dormiostay_app;
+
+    -- user_sessions: SELECT, INSERT, UPDATE, DELETE (session lifecycle & cleanup)
+    GRANT SELECT, INSERT, UPDATE, DELETE ON user_sessions TO dormiostay_app;
+
+    -- email_verification_tokens: SELECT, INSERT, UPDATE, DELETE
+    GRANT SELECT, INSERT, UPDATE, DELETE ON email_verification_tokens TO dormiostay_app;
+
+    -- password_reset_tokens: SELECT, INSERT, UPDATE, DELETE
+    GRANT SELECT, INSERT, UPDATE, DELETE ON password_reset_tokens TO dormiostay_app;
+
+    -- email_outbox: SELECT, INSERT, UPDATE, DELETE
+    GRANT SELECT, INSERT, UPDATE, DELETE ON email_outbox TO dormiostay_app;
+
+    -- Public dictionary & catalog tables: SELECT only (read-only for application)
+    GRANT SELECT ON locations TO dormiostay_app;
+    GRANT SELECT ON institutions TO dormiostay_app;
+    GRANT SELECT ON amenities TO dormiostay_app;
+    GRANT SELECT ON property_categories TO dormiostay_app;
+    GRANT SELECT ON platform_settings TO dormiostay_app;
+
+    -- audit_logs: SELECT, INSERT only (UPDATE and DELETE strictly forbidden - immutable log)
+    GRANT SELECT, INSERT ON audit_logs TO dormiostay_app;
 END
 $$;""",
 ]

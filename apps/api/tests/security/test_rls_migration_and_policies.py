@@ -237,3 +237,40 @@ def test_migration_0003_protect_users_sensitive_columns_trigger() -> None:
     # Complete cleanup in downgrade
     assert "DROP TRIGGER IF EXISTS protect_users_sensitive_columns ON users" in downgrade_text
     assert "DROP FUNCTION IF EXISTS dormiostay_protect_users_sensitive_columns()" in downgrade_text
+
+
+def test_migration_0003_role_guard_fail_closed_assertions() -> None:
+    """Verify fail-closed role guard in migration 0003 (T12-FIX-02).
+
+    1. Must NOT contain silent fail-open IF EXISTS checks for dormiostay_app.
+    2. Must assert existence and raise exception if role is missing (ERRCODE 42704).
+    3. Must assert non-elevated attributes (no superuser, bypassrls, createrole) with 42501.
+    4. Must not automatically create or alter roles.
+    """
+    mod = load_migration_0003()
+    upgrade_text = "\n".join(mod.UPGRADE_STATEMENTS)
+
+    # Silent fail-open bypass must be eliminated
+    assert (
+        "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dormiostay_app') THEN"
+        not in upgrade_text
+    )
+
+    # Fail-closed existence check
+    assert 'Required application role "dormiostay_app" does not exist' in upgrade_text
+    assert "42704" in upgrade_text
+
+    # Non-elevated attributes check
+    assert (
+        'Application role "dormiostay_app" possesses forbidden elevated attributes' in upgrade_text
+    )
+    assert "rolbypassrls" in upgrade_text
+    assert "rolsuper" in upgrade_text
+    assert "rolcreaterole" in upgrade_text
+    assert "rolcreatedb" in upgrade_text
+    assert "rolreplication" in upgrade_text
+    assert "42501" in upgrade_text
+
+    # Migration must not create roles automatically
+    assert "CREATE ROLE" not in upgrade_text
+    assert "ALTER ROLE" not in upgrade_text
