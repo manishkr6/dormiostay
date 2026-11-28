@@ -3,7 +3,7 @@
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from sqlalchemy import text
@@ -58,8 +58,15 @@ class RecoveryEvidence(BaseModel):
             raise ValueError("Recovery baseline changed")
 
 
-async def foundation_fingerprint(connection: AsyncConnection) -> str:
+FINGERPRINT_BATCH_SIZE: int = 500
+
+
+async def foundation_fingerprint(
+    connection: AsyncConnection, *, batch_size: int = FINGERPRINT_BATCH_SIZE
+) -> str:
     """Run in a stable snapshot, with owner visibility of FORCE RLS tables established."""
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
     await verify_catalog(connection, FOUNDATION)
     isolation = await connection.scalar(text("SHOW transaction_isolation"))
     if isolation not in {"repeatable read", "serializable"}:
@@ -72,15 +79,29 @@ async def foundation_fingerprint(connection: AsyncConnection) -> str:
     digest = hashlib.sha256()
     for table in sorted(APPLICATION_TABLES):
         digest.update(json.dumps(table).encode() + b"\n")
-        # Identifiers come exclusively from the committed historical table allowlist.
-        result = await connection.stream(
-            text(f'SELECT to_jsonb(t)::text FROM public."{table}" t ORDER BY t.id')
-        )
-        try:
-            async for row in result:
-                digest.update(row[0].encode() + b"\n")
-        finally:
-            await result.close()
+        last_id: str | None = None
+        while True:
+            if last_id is None:
+                stmt = text(
+                    f'SELECT to_jsonb(t)::text, t.id::text FROM public."{table}" t '
+                    f"ORDER BY t.id LIMIT :limit"
+                )
+                params: dict[str, Any] = {"limit": batch_size}
+            else:
+                stmt = text(
+                    f'SELECT to_jsonb(t)::text, t.id::text FROM public."{table}" t '
+                    f"WHERE t.id > CAST(:last_id AS uuid) ORDER BY t.id LIMIT :limit"
+                )
+                params = {"last_id": last_id, "limit": batch_size}
+            result = await connection.execute(stmt, params)
+            rows = result.all()
+            if not rows:
+                break
+            for row_json, _ in rows:
+                digest.update(row_json.encode() + b"\n")
+            if len(rows) < batch_size:
+                break
+            last_id = str(rows[-1][1])
     return digest.hexdigest()
 
 

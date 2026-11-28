@@ -1,10 +1,13 @@
 import asyncio
-from collections.abc import AsyncIterator
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import asyncpg
 
 from app.db.grant_guard import APPLICATION_TABLES
 from app.db.recovery import RecoveryEvidence, foundation_fingerprint
@@ -54,33 +57,23 @@ def test_fresh_recovery_contract() -> None:
     RecoveryEvidence.model_validate(recovery_fields()).check("1" * 64)
 
 
-class MockStreamResult:
-    def __init__(
-        self,
-        rows: list[tuple[str]],
-        fail_during_iteration: BaseException | None = None,
-    ) -> None:
+class MockBatchResult:
+    def __init__(self, rows: list[tuple[str, str]]) -> None:
         self.rows = rows
-        self.fail_during_iteration = fail_during_iteration
-        self.closed = False
 
-    async def __aiter__(self) -> AsyncIterator[tuple[str]]:
-        for row in self.rows:
-            if self.fail_during_iteration:
-                raise self.fail_during_iteration
-            yield row
-
-    async def close(self) -> None:
-        self.closed = True
+    def all(self) -> list[tuple[str, str]]:
+        return list(self.rows)
 
 
-class MockStreamingConnection:
+class MockKeysetConnection:
     def __init__(
         self,
-        table_streams: dict[str, MockStreamResult] | None = None,
+        table_data: dict[str, list[tuple[str, str]]] | None = None,
+        error_on_query: BaseException | None = None,
     ) -> None:
-        self.table_streams = table_streams or {}
-        self.created_streams: list[MockStreamResult] = []
+        self.table_data = table_data or {}
+        self.error_on_query = error_on_query
+        self.executed_queries: list[tuple[str, dict[str, Any]]] = []
 
     async def scalar(self, stmt: Any) -> Any:
         sql = str(stmt)
@@ -92,63 +85,216 @@ class MockStreamingConnection:
             return "UTC"
         return None
 
-    async def stream(self, stmt: Any) -> MockStreamResult:
+    async def execute(self, stmt: Any, params: dict[str, Any] | None = None) -> MockBatchResult:
+        if self.error_on_query:
+            raise self.error_on_query
         sql = str(stmt)
-        for table, stream in self.table_streams.items():
+        p = params or {}
+        self.executed_queries.append((sql, dict(p)))
+
+        for table, rows in self.table_data.items():
             if f'"{table}"' in sql:
-                self.created_streams.append(stream)
-                return stream
-        stream = MockStreamResult([('{"id": 1}',)])
-        self.created_streams.append(stream)
-        return stream
+                limit = p.get("limit", 500)
+                last_id = p.get("last_id")
+                if last_id is None:
+                    matching = [r for r in rows][:limit]
+                else:
+                    matching = [r for r in rows if r[1] > last_id][:limit]
+                return MockBatchResult(matching)
+
+        return MockBatchResult([])
 
 
 @pytest.mark.anyio
-async def test_foundation_fingerprint_closes_all_cursors_normally(
+async def test_foundation_fingerprint_keyset_pagination_multiple_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("app.db.recovery.verify_catalog", AsyncMock())
-    streams = {table: MockStreamResult([('{"id": 1}',)]) for table in APPLICATION_TABLES}
-    conn = MockStreamingConnection(table_streams=streams)
+    test_rows = [
+        (
+            f'{{"id": "00000000-0000-0000-0000-{i:012d}", "name": "r{i}"}}',
+            f"00000000-0000-0000-0000-{i:012d}",
+        )
+        for i in range(1, 6)
+    ]
+    data = {table: list(test_rows) for table in APPLICATION_TABLES}
+    conn = MockKeysetConnection(table_data=data)
+
+    digest = await foundation_fingerprint(conn, batch_size=2)  # type: ignore[arg-type]
+    assert len(digest) == 64
+
+    # Each table with 5 rows and batch_size=2 should execute 3 queries (2 + 2 + 1)
+    # Total queries = 11 tables * 3 = 33 queries
+    assert len(conn.executed_queries) == 33
+
+    # Inspect the 3 queries for the first table
+    q1, p1 = conn.executed_queries[0]
+    assert "ORDER BY t.id LIMIT :limit" in q1
+    assert "WHERE" not in q1
+    assert p1 == {"limit": 2}
+
+    q2, p2 = conn.executed_queries[1]
+    assert ":last_id::uuid" not in q2
+    assert "WHERE t.id > CAST(:last_id AS uuid) ORDER BY t.id LIMIT :limit" in q2
+    assert p2 == {"last_id": "00000000-0000-0000-0000-000000000002", "limit": 2}
+
+    q3, p3 = conn.executed_queries[2]
+    assert ":last_id::uuid" not in q3
+    assert "WHERE t.id > CAST(:last_id AS uuid) ORDER BY t.id LIMIT :limit" in q3
+    assert p3 == {"last_id": "00000000-0000-0000-0000-000000000004", "limit": 2}
+
+
+@pytest.mark.anyio
+async def test_foundation_fingerprint_matches_unbatched_linear_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.db.recovery.verify_catalog", AsyncMock())
+    test_rows = [
+        (
+            f'{{"id": "00000000-0000-0000-0000-{i:012d}", "v": {i}}}',
+            f"00000000-0000-0000-0000-{i:012d}",
+        )
+        for i in range(1, 8)
+    ]
+    data = {table: list(test_rows) for table in APPLICATION_TABLES}
+
+    # Calculate expected digest linearly
+    expected_digest = hashlib.sha256()
+    for table in sorted(APPLICATION_TABLES):
+        expected_digest.update(json.dumps(table).encode() + b"\n")
+        for row_json, _ in test_rows:
+            expected_digest.update(row_json.encode() + b"\n")
+
+    conn_b2 = MockKeysetConnection(table_data=data)
+    digest_b2 = await foundation_fingerprint(conn_b2, batch_size=2)  # type: ignore[arg-type]
+
+    conn_b3 = MockKeysetConnection(table_data=data)
+    digest_b3 = await foundation_fingerprint(conn_b3, batch_size=3)  # type: ignore[arg-type]
+
+    conn_b500 = MockKeysetConnection(table_data=data)
+    digest_b500 = await foundation_fingerprint(conn_b500, batch_size=500)  # type: ignore[arg-type]
+
+    assert digest_b2 == expected_digest.hexdigest()
+    assert digest_b3 == expected_digest.hexdigest()
+    assert digest_b500 == expected_digest.hexdigest()
+
+
+@pytest.mark.anyio
+async def test_foundation_fingerprint_empty_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.db.recovery.verify_catalog", AsyncMock())
+    conn = MockKeysetConnection(table_data={})
 
     digest = await foundation_fingerprint(conn)  # type: ignore[arg-type]
     assert len(digest) == 64
-    assert len(streams) == 11
-    for table, stream in streams.items():
-        assert stream.closed, f"Stream for table {table} was not closed"
+    # Empty tables execute exactly 1 query per table
+    assert len(conn.executed_queries) == len(APPLICATION_TABLES)
+    for q, p in conn.executed_queries:
+        assert "WHERE" not in q
+        assert p == {"limit": 500}
 
 
 @pytest.mark.anyio
-async def test_foundation_fingerprint_closes_cursor_on_exception(
+async def test_foundation_fingerprint_exact_batch_size_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("app.db.recovery.verify_catalog", AsyncMock())
-    failing_stream = MockStreamResult(
-        rows=[('{"id": 1}',)],
-        fail_during_iteration=RuntimeError("Stream read failure"),
-    )
-    first_table = sorted(APPLICATION_TABLES)[0]
-    conn = MockStreamingConnection(table_streams={first_table: failing_stream})
+    test_rows = [
+        ('{"id": "00000000-0000-0000-0000-000000000001"}', "00000000-0000-0000-0000-000000000001"),
+        ('{"id": "00000000-0000-0000-0000-000000000002"}', "00000000-0000-0000-0000-000000000002"),
+        ('{"id": "00000000-0000-0000-0000-000000000003"}', "00000000-0000-0000-0000-000000000003"),
+        ('{"id": "00000000-0000-0000-0000-000000000004"}', "00000000-0000-0000-0000-000000000004"),
+    ]
+    data = {sorted(APPLICATION_TABLES)[0]: list(test_rows)}
+    conn = MockKeysetConnection(table_data=data)
 
-    with pytest.raises(RuntimeError, match="Stream read failure"):
+    digest = await foundation_fingerprint(conn, batch_size=2)  # type: ignore[arg-type]
+    assert len(digest) == 64
+
+    first_table_queries = [
+        q for q, _ in conn.executed_queries if f'"{sorted(APPLICATION_TABLES)[0]}"' in q
+    ]
+    # Exactly 4 rows with batch_size=2 executes 3 queries: (2 rows, 2 rows, 0 rows)
+    assert len(first_table_queries) == 3
+
+
+@pytest.mark.anyio
+async def test_foundation_fingerprint_propagates_database_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.db.recovery.verify_catalog", AsyncMock())
+    conn = MockKeysetConnection(error_on_query=RuntimeError("database read failed"))
+
+    with pytest.raises(RuntimeError, match="database read failed"):
         await foundation_fingerprint(conn)  # type: ignore[arg-type]
 
-    assert failing_stream.closed, "Stream must be closed on exception"
-
 
 @pytest.mark.anyio
-async def test_foundation_fingerprint_closes_cursor_on_cancellation(
+async def test_foundation_fingerprint_propagates_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("app.db.recovery.verify_catalog", AsyncMock())
-    cancelling_stream = MockStreamResult(
-        rows=[('{"id": 1}',)],
-        fail_during_iteration=asyncio.CancelledError(),
-    )
-    last_table = sorted(APPLICATION_TABLES)[-1]
-    conn = MockStreamingConnection(table_streams={last_table: cancelling_stream})
+    conn = MockKeysetConnection(error_on_query=asyncio.CancelledError())
 
     with pytest.raises(asyncio.CancelledError):
         await foundation_fingerprint(conn)  # type: ignore[arg-type]
 
-    assert cancelling_stream.closed, "Stream must be closed on cancellation"
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("invalid_batch_size", [0, -1, -500, 1.5, "10", True, False])
+async def test_foundation_fingerprint_rejects_non_positive_or_non_integer_batch_size(
+    invalid_batch_size: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.db.recovery.verify_catalog", AsyncMock())
+    conn = MockKeysetConnection(table_data={})
+
+    with pytest.raises(ValueError, match="batch_size must be a positive integer"):
+        await foundation_fingerprint(conn, batch_size=invalid_batch_size)  # type: ignore[arg-type]
+
+
+@pytest.mark.anyio
+async def test_foundation_fingerprint_asyncpg_query_compilation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify generated keyset pagination SQL compiles cleanly under asyncpg.
+
+    Ensures no syntax errors, colon tokenizer collision, or parameter-binding defects.
+    """
+    monkeypatch.setattr("app.db.recovery.verify_catalog", AsyncMock())
+    test_rows = [
+        (
+            f'{{"id": "00000000-0000-0000-0000-{i:012d}", "name": "r{i}"}}',
+            f"00000000-0000-0000-0000-{i:012d}",
+        )
+        for i in range(1, 4)
+    ]
+    data = {sorted(APPLICATION_TABLES)[0]: list(test_rows)}
+    conn = MockKeysetConnection(table_data=data)
+
+    await foundation_fingerprint(conn, batch_size=2)  # type: ignore[arg-type]
+
+    dialect = asyncpg.dialect()  # type: ignore[no-untyped-call]
+    assert len(conn.executed_queries) >= 2
+
+    for raw_sql, params in conn.executed_queries:
+        assert ":last_id::uuid" not in raw_sql
+        stmt = text(raw_sql)
+        compiled = stmt.compile(dialect=dialect)
+        assert ":last_id::uuid" not in compiled.string
+
+        if "WHERE" in raw_sql:
+            assert "WHERE t.id > CAST(:last_id AS uuid) ORDER BY t.id LIMIT :limit" in raw_sql
+            assert "CAST($1 AS uuid)" in compiled.string
+            assert "LIMIT $2" in compiled.string
+            assert set(compiled.params.keys()) == {"last_id", "limit"}
+            constructed = compiled.construct_params(params)
+            assert constructed["last_id"] == params["last_id"]
+            assert constructed["limit"] == params["limit"]
+        else:
+            assert "ORDER BY t.id LIMIT :limit" in raw_sql
+            assert "LIMIT $1" in compiled.string
+            assert set(compiled.params.keys()) == {"limit"}
+            constructed = compiled.construct_params(params)
+            assert constructed["limit"] == params["limit"]
