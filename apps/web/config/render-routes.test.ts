@@ -56,6 +56,8 @@ describe('Render Blueprint Configuration (render.yaml)', () => {
     expect(content).toContain('rootDir: apps/api');
     expect(content).toContain('healthCheckPath: /healthz');
     expect(content).toContain('uvicorn app.main:app --host 0.0.0.0 --port $PORT');
+    expect(content).toMatch(/key: AUTH_ENDPOINTS_ENABLED\s+value: 'false'/);
+    expect(content).not.toMatch(/^\s*- key: (DATABASE_URL_DIRECT|NEON_API_KEY)\s*$/m);
     expect(content).toMatch(/key: APP_ENV\s+value: staging/);
     expect(content).toMatch(/key: DATABASE_URL\s+sync: false/);
     expect(content).toMatch(/key: FRONTEND_ORIGIN\s+sync: false/);
