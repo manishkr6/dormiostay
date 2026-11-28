@@ -1,36 +1,4 @@
-"""Guard and execution wrapper for Gate 4 database grants.
-
-Enforces fail-closed staging-only verification and the zero-table-grant policy for T-05:
-1. Neon Control-Plane Verification:
-   Fetches fresh metadata via authenticated HTTPS opener with strict redirect rejection.
-   Asserts project ID, branch ID, endpoint ID, and hostname match approved staging invariants.
-   Rejects protected production branch (br-holy-lake-bi0hc1lu) across all modes.
-2. Authentic TLS Transport Verification:
-   Enforces sslmode=verify-full with trusted CA certificate chain and hostname matching.
-3. Database Identity & Administrator Role Verification:
-   Asserts current_database() == "neondb".
-   Asserts current_user == "neondb_owner" and session_user == "neondb_owner".
-   Asserts target application role == "dormiostay_app" exactly.
-4. Authoritative Neon Metadata:
-   Asserts neon.branch_id, neon.project_id, neon.endpoint_id in pg_settings.
-   Fails closed on missing or conflicting Neon metadata.
-5. Zero-Table-Grant Security Policy (T-05):
-   The backend currently implements health/readiness endpoints and does NOT require
-   application-table privileges.
-   - ZERO SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER on any table.
-   - ZERO column-level privileges (has_any_column_privilege) on all governed tables.
-   - ZERO grants on audit_logs (both table and column level are denied).
-   - ZERO grants on alembic_version.
-   - ZERO table or column GRANT OPTIONs.
-   - ZERO object ownership (relations, schemas, functions, types).
-   - ZERO role memberships in pg_auth_members.
-   - ZERO unexpected callable SECURITY DEFINER routines in non-system schemas.
-   - Only independently justified CONNECT on database and USAGE on schema public are preserved.
-6. Single Transaction Architecture:
-   Starts transaction exactly once before any query execution, runs preflight, applies targeted
-   revocations on approved tables, grants schema usage, and verifies complete catalog security
-   invariants before COMMIT. Automatic rollback on any failure.
-"""
+"""Historical Gate 4 read-only foundation checks and retired mutation interface."""
 
 from __future__ import annotations
 
@@ -39,7 +7,6 @@ from urllib.parse import parse_qs, urlparse
 
 from sqlalchemy import text
 from sqlalchemy.engine import URL
-from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.db.migration_guard import (
@@ -833,47 +800,5 @@ async def execute_gate4_grants_async(
     expected_target: ApprovedTargetIdentity,
     target_role: str = APPROVED_APPLICATION_ROLE,
 ) -> dict[str, Any]:
-    """Execute Gate 4 grants using single-transaction async SQLAlchemy architecture.
-
-    Single Transaction Ownership (Fix 1):
-    - Asserts that connection is not already in an active transaction.
-    - Initiates exactly ONE transaction via `async with connection.begin():`.
-    - Executes preflight verification queries (verify_grant_connection) INSIDE the transaction.
-    - Explicitly sets search_path = public.
-    - Applies targeted revocations exclusively on the 12 approved governed tables.
-    - Grants justified USAGE on schema public.
-    - Executes comprehensive in-transaction catalog verification (verify_catalog_privileges).
-    - If any assertion fails, automatically rolls back all changes.
-    - Commits only when every preflight, mutation, and catalog assertion succeeds.
-    - Idempotent and safely repeatable when database matches approved policy.
-    """
-    if target_role != APPROVED_APPLICATION_ROLE:
-        raise ValueError(f"Target role must be '{APPROVED_APPLICATION_ROLE}', got '{target_role}'")
-
-    if connection.in_transaction():
-        raise InvalidRequestError(
-            "Connection is already in an active transaction. execute_gate4_grants_async "
-            "must establish the single transaction boundary before any SQL is executed."
-        )
-
-    async with connection.begin():
-        # 1. Preflight connection verification (runs inside the single transaction)
-        await verify_grant_connection(connection, expected_target, target_role=target_role)
-
-        # 2. Explicit search_path protection
-        await connection.execute(text("SET search_path = public"))
-
-        # 3. Targeted revocations on all 11 application tables and alembic_version
-        for tbl in ALL_GOVERNED_TABLES:
-            await connection.execute(
-                text(f'REVOKE ALL PRIVILEGES ON TABLE public."{tbl}" FROM "{target_role}"')
-            )
-
-        # 4. Preserved independently justified privileges: USAGE on schema public
-        await connection.execute(text(f'GRANT USAGE ON SCHEMA public TO "{target_role}"'))
-
-        # 5. In-transaction pre-commit security verification
-        # If any check fails, an exception is raised, triggering immediate ROLLBACK
-        verification_results = await verify_catalog_privileges(connection, target_role=target_role)
-
-    return verification_results
+    """Historical compatibility entry point. Retired before any connection use."""
+    raise RuntimeError("GATE4_MUTATION_RETIRED")

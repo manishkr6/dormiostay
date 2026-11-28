@@ -1,8 +1,7 @@
 """Focused regression tests for Gate 4 zero-table-grant security guard and execution wrapper.
 
 Verifies:
-1. Fix 1: Single transaction boundary in execute_gate4_grants_async, preflight in transaction,
-   automatic rollback on exception, and real SQLAlchemy transaction lifecycle without autobegin.
+1. Fix 1: Retired CLI and callable reject before touching the database.
 2. Fix 2: Effective column privilege checks (has_any_column_privilege, audit_logs.action,
    raw pg_attribute.attacl, raw pg_class.relacl, 7 table privileges, GRANT OPTION, default ACLs).
 3. Fix 3: Object ownership (relations, schemas, routines, types), memberships, non-system schemas,
@@ -473,53 +472,20 @@ async def test_sqlalchemy_autobegin_conflict_reproduced() -> None:
 
 
 @pytest.mark.anyio
-async def test_execute_gate4_grants_async_enforces_clean_initial_state() -> None:
-    """Fix 1: execute_gate4_grants_async rejects connection if transaction already begun."""
+async def test_retired_callable_never_touches_connection() -> None:
     conn = AsyncMock()
-    conn.in_transaction = MagicMock(return_value=True)  # Already begun
-
-    target = _make_approved_target()
-    with pytest.raises(InvalidRequestError, match="Connection is already in an active transaction"):
-        await execute_gate4_grants_async(conn, expected_target=target)
+    with pytest.raises(RuntimeError, match="GATE4_MUTATION_RETIRED"):
+        await execute_gate4_grants_async(conn, _make_approved_target())
+    assert not conn.mock_calls
 
 
 @pytest.mark.anyio
-async def test_execute_gate4_grants_async_single_transaction_lifecycle() -> None:
-    """Fix 1: Starts exactly ONE transaction, executes preflight inside, verifies, and commits."""
-    conn = _make_mock_connection()
-    target = _make_approved_target()
+async def test_retired_cli_stops_before_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.execute_gate4_grants import main
 
-    with patch("app.db.grant_guard._verify_client_tls", new_callable=AsyncMock):
-        results = await execute_gate4_grants_async(
-            conn,
-            expected_target=target,
-            target_role=APPROVED_APPLICATION_ROLE,
-        )
-
-    # 1. begin() called exactly once
-    conn.begin.assert_called_once()
-    assert len(results["table_privileges"]) == 12
-    assert "zero_effective_column_privileges_verified" in results["catalog_assertions"]
-
-
-@pytest.mark.anyio
-async def test_execute_gate4_grants_async_automatic_rollback_on_preflight_failure() -> None:
-    """Fix 1: Preflight failure inside single transaction triggers automatic rollback."""
-    # Simulate wrong administrator in database
-    conn = _make_mock_connection()
-    user_res = MagicMock()
-    user_res.first.return_value = ("unauthorized_user", "unauthorized_user")
-    conn.execute.side_effect = None
-    conn.execute.return_value = user_res
-
-    target = _make_approved_target()
-    with patch("app.db.grant_guard._verify_client_tls", new_callable=AsyncMock):
-        with pytest.raises(RuntimeError, match="differs from approved administrator"):
-            await execute_gate4_grants_async(conn, expected_target=target)
-
-    # begin context entered and exited with exception -> automatic rollback
-    conn.begin.return_value.__aenter__.assert_called_once()
-    conn.begin.return_value.__aexit__.assert_called_once()
+    monkeypatch.delenv("DATABASE_URL_DIRECT", raising=False)
+    with pytest.raises(SystemExit, match="GATE4_MUTATION_RETIRED"):
+        await main()
 
 
 # =====================================================================
