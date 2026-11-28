@@ -96,7 +96,7 @@ def test_conftest_subprocess_preserves_ambient_database_url() -> None:
         check=False,
     )
     assert result.returncode == 0, f"Pytest collection failed: {result.stderr}\n{result.stdout}"
-    assert "collected 7 items" in result.stdout
+    assert "16 tests collected" in result.stdout or "collected 16 items" in result.stdout
 
 
 def test_ci_mode_invalid_or_missing_postgres_fails_closed() -> None:

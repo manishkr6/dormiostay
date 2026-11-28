@@ -16,6 +16,7 @@ Invariants Verified:
 """
 
 import os
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -247,4 +248,296 @@ async def test_postgres_rls_tenant_cannot_elevate_role(live_database_url: str) -
             "unauthorized modification of role" in err
             or "42501" in err
             or "permission denied" in err
+        )
+
+
+def _assert_rls_check_violation(exc_info: pytest.ExceptionInfo[Any], table: str) -> None:
+    """Verify that an exception is specifically an RLS WITH CHECK violation (SQLSTATE 42501).
+
+    Ensures that generic IntegrityError, NOT NULL, FK, or missing-column errors are NOT
+    mistaken for RLS policy enforcement.
+    """
+    err = str(exc_info.value).lower()
+    # Explicitly reject unrelated integrity / schema errors
+    assert "not-null" not in err and "23502" not in err, (
+        f"False positive: caught NOT NULL error instead of RLS violation: {err}"
+    )
+    assert "foreign key" not in err and "23503" not in err, (
+        f"False positive: caught Foreign Key error instead of RLS violation: {err}"
+    )
+    assert "does not exist" not in err and "42703" not in err, (
+        f"False positive: caught missing column/table error: {err}"
+    )
+
+    # Must be SQLSTATE 42501 and/or explicit row-level security policy violation
+    has_rls_msg = (
+        f'violates row-level security policy for table "{table}"' in err
+        or "violates row-level security policy" in err
+    )
+    has_sqlstate = "42501" in err
+    assert has_rls_msg or has_sqlstate, (
+        f"Expected SQLSTATE 42501 RLS policy violation for {table}, got: {err}"
+    )
+
+
+@pytest.mark.anyio
+async def test_postgres_rls_missing_context_audit_logs_insert_denied(
+    live_database_url: str,
+) -> None:
+    """Verify missing context cannot insert into audit_logs (T12-AUDIT-01)."""
+    engine = create_async_engine(live_database_url)
+
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.user_id', '', true), set_config('app.role', '', true)")
+        )
+        with pytest.raises((IntegrityError, ProgrammingError, DBAPIError)) as exc_info:
+            await conn.execute(
+                text(
+                    "INSERT INTO audit_logs (action, target_type, reason, ip) "
+                    "VALUES ('security.test', 'system', 'missing context test', '127.0.0.1')"
+                )
+            )
+        _assert_rls_check_violation(exc_info, "audit_logs")
+
+
+@pytest.mark.anyio
+async def test_postgres_rls_tenant_context_audit_logs_insert_denied(
+    live_database_url: str,
+) -> None:
+    """Verify tenant context cannot insert into audit_logs (T12-AUDIT-01)."""
+    engine = create_async_engine(live_database_url)
+    uid = uuid4()
+
+    async with engine.connect() as conn:
+        await conn.execute(
+            text(
+                "SELECT set_config('app.user_id', :uid, true), "
+                "set_config('app.role', 'tenant', true)"
+            ),
+            {"uid": str(uid)},
+        )
+        with pytest.raises((IntegrityError, ProgrammingError, DBAPIError)) as exc_info:
+            await conn.execute(
+                text(
+                    "INSERT INTO audit_logs (action, target_type, reason, ip) "
+                    "VALUES ('security.test', 'system', 'tenant insert attempt', '127.0.0.1')"
+                )
+            )
+        _assert_rls_check_violation(exc_info, "audit_logs")
+
+
+@pytest.mark.anyio
+async def test_postgres_rls_guest_context_audit_logs_insert_denied(
+    live_database_url: str,
+) -> None:
+    """Verify guest context cannot insert into audit_logs (T12-AUDIT-01)."""
+    engine = create_async_engine(live_database_url)
+
+    async with engine.connect() as conn:
+        await conn.execute(
+            text(
+                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'guest', true)"
+            )
+        )
+        with pytest.raises((IntegrityError, ProgrammingError, DBAPIError)) as exc_info:
+            await conn.execute(
+                text(
+                    "INSERT INTO audit_logs (action, target_type, reason, ip) "
+                    "VALUES ('security.test', 'system', 'guest insert attempt', '127.0.0.1')"
+                )
+            )
+        _assert_rls_check_violation(exc_info, "audit_logs")
+
+
+@pytest.mark.anyio
+async def test_postgres_rls_system_context_audit_logs_insert_permitted(
+    live_database_url: str,
+) -> None:
+    """Verify authorized system context can insert into audit_logs (T12-AUDIT-01)."""
+    engine = create_async_engine(live_database_url)
+    unique_action = f"audit.system.test.{uuid4()}"
+
+    async with engine.connect() as conn:
+        await conn.execute(
+            text(
+                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'system', true)"
+            )
+        )
+        res = await conn.execute(
+            text(
+                "INSERT INTO audit_logs (action, target_type, reason, ip) "
+                "VALUES (:act, 'system', 'authorized system insert', '127.0.0.1') "
+                "RETURNING id"
+            ),
+            {"act": unique_action},
+        )
+        row = res.first()
+        assert row is not None, "System context failed to insert into audit_logs"
+        assert row[0] is not None
+
+
+@pytest.mark.anyio
+async def test_postgres_rls_admin_context_audit_logs_select_permitted(
+    live_database_url: str,
+) -> None:
+    """Verify admin context can read audit logs (T12-AUDIT-01)."""
+    engine = create_async_engine(live_database_url)
+    unique_action = f"audit.admin.read.{uuid4()}"
+
+    async with engine.connect() as conn:
+        # 1. System inserts the audit record
+        await conn.execute(
+            text(
+                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'system', true)"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO audit_logs (action, target_type, reason, ip) "
+                "VALUES (:act, 'system', 'admin read test fixture', '127.0.0.1')"
+            ),
+            {"act": unique_action},
+        )
+
+        # 2. Admin queries the audit record
+        await conn.execute(
+            text(
+                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'admin', true)"
+            )
+        )
+        res = await conn.execute(
+            text("SELECT id, action FROM audit_logs WHERE action = :act"),
+            {"act": unique_action},
+        )
+        row = res.first()
+        assert row is not None, "Admin context failed to read audit_logs"
+        assert row[1] == unique_action
+
+
+@pytest.mark.anyio
+async def test_postgres_rls_tenant_context_audit_logs_select_denied(
+    live_database_url: str,
+) -> None:
+    """Verify tenant context cannot read audit logs (T12-AUDIT-01)."""
+    engine = create_async_engine(live_database_url)
+    unique_action = f"audit.tenant.leak.{uuid4()}"
+
+    async with engine.connect() as conn:
+        # 1. System inserts the audit record
+        await conn.execute(
+            text(
+                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'system', true)"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO audit_logs (action, target_type, reason, ip) "
+                "VALUES (:act, 'system', 'tenant read isolation test', '127.0.0.1')"
+            ),
+            {"act": unique_action},
+        )
+
+        # 2. Tenant queries the audit record -> must return 0 rows
+        await conn.execute(
+            text(
+                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'tenant', true)"
+            )
+        )
+        res = await conn.execute(
+            text("SELECT id FROM audit_logs WHERE action = :act"),
+            {"act": unique_action},
+        )
+        assert res.first() is None, "Tenant context leaked audit_logs rows"
+
+
+@pytest.mark.anyio
+async def test_postgres_rls_audit_logs_update_delete_denied(
+    live_database_url: str,
+) -> None:
+    """Verify audit_logs UPDATE and DELETE are strictly denied for all contexts (T12-AUDIT-01)."""
+    engine = create_async_engine(live_database_url)
+    unique_action = f"audit.immutable.{uuid4()}"
+
+    async with engine.connect() as conn:
+        # 1. System inserts a row
+        await conn.execute(
+            text(
+                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'system', true)"
+            )
+        )
+        res = await conn.execute(
+            text(
+                "INSERT INTO audit_logs (action, target_type, reason, ip) "
+                "VALUES (:act, 'system', 'immutability test', '127.0.0.1') "
+                "RETURNING id"
+            ),
+            {"act": unique_action},
+        )
+        row = res.first()
+        assert row is not None
+        target_id = row[0]
+
+        # 2. Admin attempts UPDATE -> denied by trigger and/or grant absence
+        await conn.execute(
+            text(
+                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'admin', true)"
+            )
+        )
+        with pytest.raises((IntegrityError, ProgrammingError, DBAPIError)) as exc_info:
+            await conn.execute(
+                text("UPDATE audit_logs SET reason = 'tampered' WHERE id = :id"),
+                {"id": str(target_id)},
+            )
+        err = str(exc_info.value).lower()
+        assert "audit_logs is append-only" in err or "42501" in err or "permission denied" in err
+
+        # 3. Admin attempts DELETE -> denied by trigger and/or grant absence
+        with pytest.raises((IntegrityError, ProgrammingError, DBAPIError)) as exc_info:
+            await conn.execute(
+                text("DELETE FROM audit_logs WHERE id = :id"),
+                {"id": str(target_id)},
+            )
+        err = str(exc_info.value).lower()
+        assert "audit_logs is append-only" in err or "42501" in err or "permission denied" in err
+
+
+@pytest.mark.anyio
+async def test_postgres_rls_exact_cumulative_policy_inventory(
+    live_database_url: str,
+) -> None:
+    """Verify exactly 43 cumulative policies exist across all governed tables (T12-AUDIT-01)."""
+    engine = create_async_engine(live_database_url)
+
+    async with engine.connect() as conn:
+        res = await conn.execute(text("SELECT count(*) FROM pg_policy"))
+        count = res.scalar()
+        assert count == 43, f"Expected exactly 43 cumulative policies, but catalog reports {count}"
+
+
+@pytest.mark.anyio
+async def test_postgres_rls_audit_logs_policy_catalog_clean(
+    live_database_url: str,
+) -> None:
+    """Verify audit_logs contains only audit_logs_select and audit_logs_insert (T12-AUDIT-01).
+
+    Proves that foundation policies audit_insert and audit_admin_read do NOT survive.
+    """
+    engine = create_async_engine(live_database_url)
+
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text(
+                "SELECT polname FROM pg_policy "
+                "WHERE polrelid = 'audit_logs'::regclass "
+                "ORDER BY polname"
+            )
+        )
+        policies = [row[0] for row in res.fetchall()]
+        assert policies == ["audit_logs_insert", "audit_logs_select"], (
+            f"Unexpected policy catalog on audit_logs: {policies}"
+        )
+        assert "audit_insert" not in policies, "Vulnerability: audit_insert survived migration 0003"
+        assert "audit_admin_read" not in policies, (
+            "Legacy policy audit_admin_read survived migration 0003"
         )

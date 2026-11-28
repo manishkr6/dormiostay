@@ -281,6 +281,8 @@ UPGRADE_STATEMENTS = [
     # -------------------------------------------------------------------------
     # 12. audit_logs (append-only, immutable security audit trail)
     # -------------------------------------------------------------------------
+    "DROP POLICY IF EXISTS audit_insert ON audit_logs",
+    "DROP POLICY IF EXISTS audit_admin_read ON audit_logs",
     "ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY",
     "ALTER TABLE audit_logs FORCE ROW LEVEL SECURITY",
     """CREATE POLICY audit_logs_select ON audit_logs FOR SELECT
@@ -420,8 +422,9 @@ DOWNGRADE_STATEMENTS = [
     # 12. audit_logs
     "DROP POLICY IF EXISTS audit_logs_select ON audit_logs",
     "DROP POLICY IF EXISTS audit_logs_insert ON audit_logs",
-    "ALTER TABLE audit_logs NO FORCE ROW LEVEL SECURITY",
-    "ALTER TABLE audit_logs DISABLE ROW LEVEL SECURITY",
+    "CREATE POLICY audit_insert ON audit_logs FOR INSERT WITH CHECK (true)",
+    """CREATE POLICY audit_admin_read ON audit_logs FOR SELECT
+    USING (current_setting('app.role', true) = 'admin')""",
     # 13. Revoke runtime grants
     """DO $$
 BEGIN

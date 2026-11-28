@@ -118,15 +118,27 @@ def test_migration_0003_nullif_uuid_cast_safety() -> None:
 
 
 def test_migration_0003_downgrade_completeness() -> None:
-    """Verify that downgrade drops all created policies and disables RLS."""
+    """Verify that downgrade drops created policies and restores table RLS states."""
     mod = load_migration_0003()
     downgrade_text = "\n".join(mod.DOWNGRADE_STATEMENTS)
 
     for table in GOVERNED_TABLES:
-        disable_stmt = f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"
-        no_force_stmt = f"ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY"
-        assert disable_stmt in downgrade_text, f"Missing '{disable_stmt}' in downgrade"
-        assert no_force_stmt in downgrade_text, f"Missing '{no_force_stmt}' in downgrade"
+        if table == "audit_logs":
+            # audit_logs RLS was established by 0001_foundation; downgrade to 0002 must
+            # keep ENABLE and FORCE RLS active and NOT disable or unforce them.
+            disable_stmt = f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"
+            no_force_stmt = f"ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY"
+            assert disable_stmt not in downgrade_text, (
+                f"Downgrade must preserve audit_logs RLS, but found '{disable_stmt}'"
+            )
+            assert no_force_stmt not in downgrade_text, (
+                f"Downgrade must preserve audit_logs FORCE RLS, but found '{no_force_stmt}'"
+            )
+        else:
+            disable_stmt = f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"
+            no_force_stmt = f"ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY"
+            assert disable_stmt in downgrade_text, f"Missing '{disable_stmt}' in downgrade"
+            assert no_force_stmt in downgrade_text, f"Missing '{no_force_stmt}' in downgrade"
 
 
 def test_migration_0003_least_privilege_table_grants_matrix() -> None:
@@ -274,3 +286,69 @@ def test_migration_0003_role_guard_fail_closed_assertions() -> None:
     # Migration must not create roles automatically
     assert "CREATE ROLE" not in upgrade_text
     assert "ALTER ROLE" not in upgrade_text
+
+
+def test_migration_0003_inherited_audit_policies_dropped() -> None:
+    """Verify that legacy 0001 foundation audit policies are explicitly dropped (T12-AUDIT-01).
+
+    1. Must contain DROP POLICY IF EXISTS audit_insert ON audit_logs.
+    2. Must contain DROP POLICY IF EXISTS audit_admin_read ON audit_logs.
+    3. The drops must precede the creation of replacement audit_logs policies.
+    """
+    mod = load_migration_0003()
+    statements = mod.UPGRADE_STATEMENTS
+    upgrade_text = "\n".join(statements)
+
+    assert "DROP POLICY IF EXISTS audit_insert ON audit_logs" in upgrade_text
+    assert "DROP POLICY IF EXISTS audit_admin_read ON audit_logs" in upgrade_text
+
+    # Precedence check
+    drop_insert_idx = next(
+        i for i, s in enumerate(statements) if "DROP POLICY IF EXISTS audit_insert" in s
+    )
+    drop_admin_idx = next(
+        i for i, s in enumerate(statements) if "DROP POLICY IF EXISTS audit_admin_read" in s
+    )
+    create_select_idx = next(
+        i for i, s in enumerate(statements) if "CREATE POLICY audit_logs_select" in s
+    )
+    create_insert_idx = next(
+        i for i, s in enumerate(statements) if "CREATE POLICY audit_logs_insert" in s
+    )
+
+    assert drop_insert_idx < create_select_idx
+    assert drop_insert_idx < create_insert_idx
+    assert drop_admin_idx < create_select_idx
+    assert drop_admin_idx < create_insert_idx
+
+
+def test_migration_0003_downgrade_restores_foundation_audit_policies() -> None:
+    """Verify that downgrade restores original 0001 foundation audit policies (T12-AUDIT-01)."""
+    mod = load_migration_0003()
+    downgrade_text = "\n".join(mod.DOWNGRADE_STATEMENTS)
+
+    # Must drop replacement policies
+    assert "DROP POLICY IF EXISTS audit_logs_select ON audit_logs" in downgrade_text
+    assert "DROP POLICY IF EXISTS audit_logs_insert ON audit_logs" in downgrade_text
+
+    # Must restore exact foundation policies
+    assert "CREATE POLICY audit_insert ON audit_logs FOR INSERT WITH CHECK (true)" in downgrade_text
+    assert "CREATE POLICY audit_admin_read ON audit_logs FOR SELECT" in downgrade_text
+    assert "current_setting('app.role', true) = 'admin'" in downgrade_text
+
+
+def test_migration_0003_exact_43_policy_definitions() -> None:
+    """Verify that migration 0003 defines exactly 43 RLS policies across all 12 tables."""
+    import re
+
+    mod = load_migration_0003()
+    upgrade_text = "\n".join(mod.UPGRADE_STATEMENTS)
+
+    policy_matches = re.findall(
+        r"CREATE\s+POLICY\s+([a-z_]+)\s+ON\s+([a-z_]+)", upgrade_text, re.IGNORECASE
+    )
+    assert len(policy_matches) == 43, f"Expected 43 policies, found {len(policy_matches)}"
+
+    # Audit logs must have exactly two replacement policies
+    audit_policies = [p for p, t in policy_matches if t == "audit_logs"]
+    assert sorted(audit_policies) == ["audit_logs_insert", "audit_logs_select"]
