@@ -75,23 +75,24 @@ jobs:
           PG_SERVICE: ${{ job.services.postgres.id }}
         run: |
           set -eu
-          # Use the existing service's network namespace so both ends see loopback.
-          service_pid=$(docker inspect --format '{{.State.Pid}}' "$PG_SERVICE")
-          loopback() {
-            sudo nsenter --target "$service_pid" --net -- setpriv \
-              --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --no-new-privs -- "$@"
-          }
           for name in dormiostay_t03_test_gate3b dormiostay_t03_test_rehearsal dormiostay_t03_test_commit; do
-            loopback env PGPASSWORD=test_owner_password createdb -h 127.0.0.1 -U neondb_owner "$name"
-            loopback env PGPASSWORD=test_owner_password psql -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -U neondb_owner -d "$name" \
+            PGPASSWORD=test_owner_password createdb -h localhost -U neondb_owner "$name"
+            PGPASSWORD=test_owner_password psql -X -v ON_ERROR_STOP=1 -h localhost -U neondb_owner -d "$name" \
               -c "REVOKE ALL ON DATABASE $name FROM PUBLIC" \
               -c "GRANT CONNECT ON DATABASE $name TO dormiostay_app" \
               -c "GRANT USAGE ON SCHEMA public TO dormiostay_app"
-            owner_url="postgresql+asyncpg://neondb_owner:test_owner_password@127.0.0.1:5432/$name"
-            loopback env DATABASE_URL_DIRECT="$owner_url" TEST_DATABASE_NAME="$name" .venv/bin/alembic upgrade 0001_foundation
+            DATABASE_URL_DIRECT="postgresql+asyncpg://neondb_owner:test_owner_password@localhost:5432/$name" \
+            TEST_DATABASE_NAME="$name" \
+            uv run alembic upgrade 0001_foundation
           done
+          # Use the existing service's network namespace so both ends see loopback.
+          service_pid=$(docker inspect --format '{{.State.Pid}}' "$PG_SERVICE")
+          loopback() {
+            sudo -E nsenter --target "$service_pid" --net -- setpriv \
+              --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --no-new-privs -- "$@"
+          }
           name=dormiostay_t03_test_gate3b
-          loopback env T12_GATE3B_TEST=1 TEST_DATABASE_NAME="$name" \
+          loopback env PATH="$PATH" HOME="$HOME" T12_GATE3B_TEST=1 TEST_DATABASE_NAME="$name" \
             DATABASE_URL_DIRECT="postgresql+asyncpg://neondb_owner:test_owner_password@127.0.0.1:5432/$name" \
             .venv/bin/pytest tests/integration/t12 -v
       - name: Live PostgreSQL RLS security tests (T-12)
