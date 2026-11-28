@@ -354,27 +354,50 @@ async def test_postgres_rls_guest_context_audit_logs_insert_denied(
 async def test_postgres_rls_system_context_audit_logs_insert_permitted(
     live_database_url: str,
 ) -> None:
-    """Verify authorized system context can insert into audit_logs (T12-AUDIT-01)."""
+    """Verify authorized system context can insert into audit_logs (T12-AUDIT-01).
+
+    System context has INSERT privilege under audit_logs_insert policy.
+    Because audit_logs_select is restricted to admin, system insert does not
+    use RETURNING id, and persistence is confirmed via an authorized admin query
+    in an isolated transaction.
+    """
     engine = create_async_engine(live_database_url)
     unique_action = f"audit.system.test.{uuid4()}"
 
-    async with engine.connect() as conn:
-        await conn.execute(
-            text(
-                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'system', true)"
+    try:
+        # 1. System context commits the audit record without RETURNING
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "SELECT set_config('app.user_id', '', true), "
+                    "set_config('app.role', 'system', true)"
+                )
             )
-        )
-        res = await conn.execute(
-            text(
-                "INSERT INTO audit_logs (action, target_type, reason, ip) "
-                "VALUES (:act, 'system', 'authorized system insert', '127.0.0.1') "
-                "RETURNING id"
-            ),
-            {"act": unique_action},
-        )
-        row = res.first()
-        assert row is not None, "System context failed to insert into audit_logs"
-        assert row[0] is not None
+            await conn.execute(
+                text(
+                    "INSERT INTO audit_logs (action, target_type, reason, ip) "
+                    "VALUES (:act, 'system', 'authorized system insert', '127.0.0.1')"
+                ),
+                {"act": unique_action},
+            )
+
+        # 2. Confirm committed persistence via authorized admin read in a separate transaction
+        async with engine.connect() as conn:
+            await conn.execute(
+                text(
+                    "SELECT set_config('app.user_id', '', true), "
+                    "set_config('app.role', 'admin', true)"
+                )
+            )
+            res = await conn.execute(
+                text("SELECT id, action FROM audit_logs WHERE action = :act"),
+                {"act": unique_action},
+            )
+            row = res.first()
+            assert row is not None, "System context failed to persist audit_logs record"
+            assert row[1] == unique_action
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.anyio
@@ -455,51 +478,132 @@ async def test_postgres_rls_tenant_context_audit_logs_select_denied(
 async def test_postgres_rls_audit_logs_update_delete_denied(
     live_database_url: str,
 ) -> None:
-    """Verify audit_logs UPDATE and DELETE are strictly denied for all contexts (T12-AUDIT-01)."""
+    """Verify audit_logs UPDATE and DELETE are strictly denied for all contexts (T12-AUDIT-01).
+
+    Proves defense-in-depth immutability across isolated transactions:
+    1. System context creates and COMMITS the test fixture.
+    2. Admin context reads target_id in a clean transaction.
+    3. Admin UPDATE is denied with genuine SQLSTATE 42501 (not aborted transaction 25P02).
+    4. Admin DELETE is denied in an un-aborted transaction with SQLSTATE 42501 (not 25P02).
+    5. Admin context verifies the record remains intact and unmodified in the database.
+    """
     engine = create_async_engine(live_database_url)
     unique_action = f"audit.immutable.{uuid4()}"
 
-    async with engine.connect() as conn:
-        # 1. System inserts a row
-        await conn.execute(
-            text(
-                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'system', true)"
-            )
-        )
-        res = await conn.execute(
-            text(
-                "INSERT INTO audit_logs (action, target_type, reason, ip) "
-                "VALUES (:act, 'system', 'immutability test', '127.0.0.1') "
-                "RETURNING id"
-            ),
-            {"act": unique_action},
-        )
-        row = res.first()
-        assert row is not None
-        target_id = row[0]
-
-        # 2. Admin attempts UPDATE -> denied by trigger and/or grant absence
-        await conn.execute(
-            text(
-                "SELECT set_config('app.user_id', '', true), set_config('app.role', 'admin', true)"
-            )
-        )
-        with pytest.raises((IntegrityError, ProgrammingError, DBAPIError)) as exc_info:
+    try:
+        # A. Create the fixture: System inserts and COMMITS the row without RETURNING
+        async with engine.begin() as conn:
             await conn.execute(
-                text("UPDATE audit_logs SET reason = 'tampered' WHERE id = :id"),
+                text(
+                    "SELECT set_config('app.user_id', '', true), "
+                    "set_config('app.role', 'system', true)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO audit_logs (action, target_type, reason, ip) "
+                    "VALUES (:act, 'system', 'immutability test', '127.0.0.1')"
+                ),
+                {"act": unique_action},
+            )
+
+        # B. Obtain target row ID: Admin queries the created row in a clean transaction
+        async with engine.connect() as conn:
+            await conn.execute(
+                text(
+                    "SELECT set_config('app.user_id', '', true), "
+                    "set_config('app.role', 'admin', true)"
+                )
+            )
+            res = await conn.execute(
+                text("SELECT id FROM audit_logs WHERE action = :act"),
+                {"act": unique_action},
+            )
+            row = res.first()
+            assert row is not None, "Audit log fixture was not inserted"
+            target_id = row[0]
+
+        # C. Test UPDATE denial in a fresh transaction -> denied by grant absence / trigger
+        async with engine.connect() as conn:
+            await conn.execute(
+                text(
+                    "SELECT set_config('app.user_id', '', true), "
+                    "set_config('app.role', 'admin', true)"
+                )
+            )
+            with pytest.raises((IntegrityError, ProgrammingError, DBAPIError)) as exc_info:
+                await conn.execute(
+                    text("UPDATE audit_logs SET reason = 'tampered' WHERE id = :id"),
+                    {"id": str(target_id)},
+                )
+            await conn.rollback()
+            err = str(exc_info.value).lower()
+            assert "25p02" not in err, (
+                f"Defect: transaction was aborted before UPDATE execution: {err}"
+            )
+            assert "23502" not in err and "not-null" not in err
+            assert "23503" not in err and "foreign key" not in err
+            assert "42703" not in err and "does not exist" not in err
+            has_expected_denial = (
+                "42501" in err
+                or "audit_logs is append-only" in err
+                or "permission denied" in err
+                or "violates row-level security policy" in err
+            )
+            assert has_expected_denial, (
+                f"Expected SQLSTATE 42501 or immutable trigger denial for UPDATE, got: {err}"
+            )
+
+        # D. Test DELETE denial in an un-aborted transaction -> denied by grant absence / trigger
+        async with engine.connect() as conn:
+            await conn.execute(
+                text(
+                    "SELECT set_config('app.user_id', '', true), "
+                    "set_config('app.role', 'admin', true)"
+                )
+            )
+            with pytest.raises((IntegrityError, ProgrammingError, DBAPIError)) as exc_info:
+                await conn.execute(
+                    text("DELETE FROM audit_logs WHERE id = :id"),
+                    {"id": str(target_id)},
+                )
+            await conn.rollback()
+            err = str(exc_info.value).lower()
+            assert "25p02" not in err, (
+                f"Defect: transaction was aborted before DELETE execution: {err}"
+            )
+            assert "23502" not in err and "not-null" not in err
+            assert "23503" not in err and "foreign key" not in err
+            assert "42703" not in err and "does not exist" not in err
+            has_expected_denial = (
+                "42501" in err
+                or "audit_logs is append-only" in err
+                or "permission denied" in err
+                or "violates row-level security policy" in err
+            )
+            assert has_expected_denial, (
+                f"Expected SQLSTATE 42501 or immutable trigger denial for DELETE, got: {err}"
+            )
+
+        # E. Verify immutability: Row remains intact in a fresh, healthy admin transaction
+        async with engine.connect() as conn:
+            await conn.execute(
+                text(
+                    "SELECT set_config('app.user_id', '', true), "
+                    "set_config('app.role', 'admin', true)"
+                )
+            )
+            res_verify = await conn.execute(
+                text("SELECT reason FROM audit_logs WHERE id = :id"),
                 {"id": str(target_id)},
             )
-        err = str(exc_info.value).lower()
-        assert "audit_logs is append-only" in err or "42501" in err or "permission denied" in err
-
-        # 3. Admin attempts DELETE -> denied by trigger and/or grant absence
-        with pytest.raises((IntegrityError, ProgrammingError, DBAPIError)) as exc_info:
-            await conn.execute(
-                text("DELETE FROM audit_logs WHERE id = :id"),
-                {"id": str(target_id)},
+            verify_row = res_verify.first()
+            assert verify_row is not None, "Audit log row was deleted despite denial"
+            assert verify_row[0] == "immutability test", (
+                f"Audit log row was modified despite denial: {verify_row[0]}"
             )
-        err = str(exc_info.value).lower()
-        assert "audit_logs is append-only" in err or "42501" in err or "permission denied" in err
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.anyio

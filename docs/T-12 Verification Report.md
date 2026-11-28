@@ -4,7 +4,7 @@
 - **Ticket:** T-12 — Role permissions and row-level security
 - **Branch:** `feature/t12-implementation`
 - **Base Commit / Parent HEAD:** `7faaa8984776555e975c52997694b68d00875d0a` (`fix(email): prevent duplicate outbox dispatch from batch lock release`)
-- **Status:** **T12-AUDIT-01 INDEPENDENTLY APPROVED BY GEMINI 4 HYDROGEN — READY FOR ONE LOCAL COMMIT**
+- **Status:** **T12-AUDIT-01 TRANSACTION ISOLATION CORRECTION APPROVED BY GEMINI 4 HYDROGEN — READY FOR ONE LOCAL COMMIT**
 
 ---
 
@@ -385,6 +385,50 @@ Under T-05's zero-table-grant baseline, `dormiostay_app` possesses zero default 
   - `auth_endpoints_enabled = False` strictly preserved.
   - Note: Direct persistent database queries have not been executed against Neon staging or production; staging is confirmed at `0001_foundation` from historical Gate 3 records.
 
+### 5.8 T12-AUDIT-01 Remote CI Results & Transaction Isolation Remediation
+- **GitHub Actions CI Run:** `46095935764` for commit `91fd909435031103b0da2df4952154007660022e`.
+- **Remote CI Run Results:**
+  - `web` job: **PASSED** (84 tests, build succeeded).
+  - `mobile` job: **PASSED** (88 tests, config verified).
+  - `api` job: **FAILED** in `Live PostgreSQL RLS security tests (T-12)`.
+- **Live PostgreSQL Engine Evidence:**
+  - Disposable PostgreSQL 16 container started healthy and provisioned `dormiostay_app` role.
+  - Migration chain `0001_foundation` -> `0002_email_outbox` -> `0003_row_level_security` completed successfully.
+  - Exactly **43 cumulative RLS policies** verified in live database catalog (`test_postgres_rls_exact_cumulative_policy_inventory` PASSED).
+  - Clean `audit_logs` policy catalog verified (`test_postgres_rls_audit_logs_policy_catalog_clean` PASSED): only `audit_logs_insert` and `audit_logs_select` exist; legacy `audit_insert` and `audit_admin_read` are absent.
+  - 14 live tests passed; 2 failed; 0 skipped.
+- **Failure Root Cause Analysis (INSERT ... RETURNING):**
+  - Both failing tests (`test_postgres_rls_system_context_audit_logs_insert_permitted` and `test_postgres_rls_audit_logs_update_delete_denied`) executed `INSERT INTO audit_logs ... RETURNING id` under `app.role = 'system'`.
+  - Under PostgreSQL RLS rules (§5.8), an `INSERT` statement containing `RETURNING` checks BOTH the table's `WITH CHECK` policy (for INSERT) and the table's `USING` policy (for SELECT, as RETURNING reads the newly inserted row).
+  - Because `audit_logs_select` strictly restricts read access to `app.role = 'admin'`, the `SELECT` policy evaluated to FALSE for system context, raising `SQLSTATE 42501 InsufficientPrivilegeError: new row violates row-level security policy for table "audit_logs"`.
+- **Application Requirement Assessment:**
+  - Application code does not require system-context `RETURNING id`. `audit_logs` is an immutable append-only audit trail; only admins query audit logs (`audit_logs_select`).
+- **Independent Hydrogen Finding (SQLSTATE 25P02 & Transaction Contamination):**
+  - Gemini 4 Hydrogen identified that executing `UPDATE`, `DELETE`, and `SELECT` sequentially on a single uncommitted transaction creates an aborted transaction cascade:
+    1. A failed UPDATE leaves the PostgreSQL transaction in the `25P02` aborted state (`current transaction is aborted, commands ignored until end of transaction block`).
+    2. The subsequent DELETE is aborted by PostgreSQL without evaluating DELETE grants, RLS, or triggers, which would fail the assertion or cause false denial.
+    3. An unhandled verification SELECT on the aborted transaction crashes the test suite.
+    4. Rolling back an uncommitted transaction would destroy the fixture, failing the immutability check.
+- **Exact Architectural Remediation:**
+  - In `apps/api/tests/security/test_postgres_rls_integration.py`:
+    1. `test_postgres_rls_system_context_audit_logs_insert_permitted`:
+       - System INSERT is committed in its own `async with engine.begin()` transaction without `RETURNING`.
+       - Persistence is verified via an authorized admin `SELECT` in a separate clean transaction.
+       - Engine is disposed in a `finally` block (`await engine.dispose()`).
+    2. `test_postgres_rls_audit_logs_update_delete_denied`:
+       - Phase A (Fixture creation): System context inserts and commits the row in its own `engine.begin()` transaction without `RETURNING`.
+       - Phase B (Target ID retrieval): Admin queries `target_id` in a separate clean transaction.
+       - Phase C (UPDATE denial): Admin attempts UPDATE in an isolated transaction; explicitly catches denial, rolls back, verifies SQLSTATE `42501` / immutable trigger / permission denial, and explicitly asserts `25P02` is absent.
+       - Phase D (DELETE denial): Admin attempts DELETE in an entirely separate clean, un-aborted transaction; catches denial, rolls back, verifies SQLSTATE `42501` / immutable trigger / permission denial, and explicitly asserts `25P02` is absent.
+       - Phase E (Immutability check): Admin verifies the original record exists and remains untouched (`reason == "immutability test"`) in a fresh healthy transaction.
+       - Engine is disposed in a `finally` block (`await engine.dispose()`).
+- **Local Verification:**
+  - 53 targeted regression tests passed.
+  - 745 offline backend tests passed, 16 skipped.
+  - 16 live RLS tests collected.
+  - Ruff, Mypy, Prettier, git diff --check clean.
+- **Status:** Independently approved by Gemini 4 Hydrogen (`APPROVED — T12-AUDIT-01 CORRECTION READY FOR ONE LOCAL COMMIT`); finalized in a single local corrective commit; remote CI verification on live PostgreSQL still pending push.
+
 ---
 
 ## 6. Verification Results
@@ -429,14 +473,12 @@ All local verification suites were executed:
 ## 8. Git Inventory & Review Baseline
 
 - **Active Branch:** `feature/t12-implementation`
-- **Starting Commit (HEAD):** `33ce8149a6080cafdb1aa285881fe451cd614f27`
-- **Working Tree Inventory (T12-AUDIT-01 remediation):**
-  - Tracked modifications (5):
-    - `apps/api/alembic/versions/0003_row_level_security.py`
-    - `apps/api/tests/security/test_rls_migration_and_policies.py`
+- **Starting Commit (Parent HEAD):** `91fd909435031103b0da2df4952154007660022e` (`fix(security): drop legacy permissive audit policies in migration 0003`)
+- **Remote Synchronization:** Up to date with `origin/feature/t12-implementation`.
+- **Working Tree Inventory (T12-AUDIT-01 transaction-isolation correction):**
+  - Tracked modifications (2):
     - `apps/api/tests/security/test_postgres_rls_integration.py`
-    - `apps/api/tests/unit/test_t12_ci_database_env.py`
     - `docs/T-12 Verification Report.md`
   - Untracked files: `0`.
-- **Staged Changes:** Ready for single local commit.
-- **Commit Closure:** Finalizing exactly one local commit with message `fix(security): drop legacy permissive audit policies in migration 0003`.
+- **Staged Changes:** Ready for single local corrective commit.
+- **Commit Closure:** Finalizing exactly one local commit with message `test(security): isolate audit RLS mutation checks in PostgreSQL transactions`.
