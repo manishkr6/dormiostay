@@ -159,6 +159,7 @@ def verify_neon_control_plane(
     timeout: float = 10.0,
     transport: Any = None,
     opener: urllib.request.OpenerDirector | None = None,
+    require_read_write: bool = False,
 ) -> ApprovedTargetIdentity:
     """Fetch and verify fresh staging metadata from authenticated Neon API.
 
@@ -262,6 +263,9 @@ def verify_neon_control_plane(
             f"Control-plane endpoint mismatch. Expected host '{APPROVED_STAGING_HOST}', "
             f"found: {found_hosts}"
         )
+
+    if require_read_write and matching_ep.get("type") != "read_write":
+        raise ValueError("Approved staging endpoint must be read-write")
 
     ep_id = matching_ep.get("id")
     if ep_id != APPROVED_STAGING_ENDPOINT_ID:
