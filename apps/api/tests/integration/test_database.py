@@ -123,16 +123,20 @@ def test_actual_application_login(database: str) -> None:
         admin = create_async_engine(async_url(database), poolclass=NullPool)
         app_engine = create_async_engine(async_url(app_url), poolclass=NullPool)
         try:
-            async with admin.begin() as connection:
-                await connection.execute(text("GRANT USAGE ON SCHEMA public TO dormiostay_app"))
-                await connection.execute(
-                    text("GRANT SELECT, INSERT ON audit_logs TO dormiostay_app")
-                )
             async with async_sessionmaker(admin)() as session:
                 with pytest.raises(RuntimeError, match="DATABASE_ROLE_UNSAFE"):
                     await verify_runtime_role(session)
             factory = async_sessionmaker(app_engine)
-            async with transaction(factory) as session:
+            with pytest.raises(DBAPIError) as denied:
+                async with transaction(factory) as guest:
+                    await guest.execute(
+                        text(
+                            "INSERT INTO audit_logs(action,target_type)"
+                            " VALUES ('guest_denied','test')"
+                        )
+                    )
+            assert getattr(denied.value.orig, "sqlstate", None) == "42501"
+            async with transaction(factory, role="system") as session:
                 await verify_runtime_role(session)
                 assert await session.scalar(text("SELECT current_user")) == "dormiostay_app"
                 await session.execute(
@@ -218,6 +222,16 @@ def test_ordinary_application_role_audit_permissions(database: str) -> None:
                     )
                 ).one()
                 assert tuple(flags) == (False, False)
+                with pytest.raises(DBAPIError) as denied:
+                    async with connection.begin_nested():
+                        await connection.execute(
+                            text(
+                                "INSERT INTO audit_logs(action,target_type)"
+                                " VALUES ('missing_denied','test')"
+                            )
+                        )
+                assert getattr(denied.value.orig, "sqlstate", None) == "42501"
+                await connection.execute(text("SELECT set_config('app.role','system',true)"))
                 await connection.execute(
                     text("INSERT INTO audit_logs(action,target_type) VALUES ('test','test')")
                 )

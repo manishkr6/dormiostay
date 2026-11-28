@@ -1,10 +1,10 @@
 # T-12 Verification Report: Role Permissions and Row-Level Security
 
-- **Date:** 2026-11-26 (Asia/Kolkata)
+- **Date:** 2026-11-28 (Asia/Kolkata)
 - **Ticket:** T-12 — Role permissions and row-level security
 - **Branch:** `feature/t12-implementation`
-- **Base Commit / Parent HEAD:** `7faaa8984776555e975c52997694b68d00875d0a` (`fix(email): prevent duplicate outbox dispatch from batch lock release`)
-- **Status:** **T12-AUDIT-01 TRANSACTION ISOLATION CORRECTION APPROVED BY GEMINI 4 HYDROGEN — READY FOR ONE LOCAL COMMIT**
+- **Base Commit / Parent HEAD:** `3e02f16ec513fcbb81dd9a0d1eb5725cb1c4c0c3` (`test(security): isolate audit RLS mutation checks in PostgreSQL transactions`)
+- **Status:** **T-12 ENGINEERING COMPLETE & STABILIZED LOCALLY — READY FOR INDEPENDENT SECURITY REVIEW (T12-FIX-03..07 IMPLEMENTED, 0 COMMITS, 0 PUSHES)**
 
 ---
 
@@ -427,33 +427,158 @@ Under T-05's zero-table-grant baseline, `dormiostay_app` possesses zero default 
   - 745 offline backend tests passed, 16 skipped.
   - 16 live RLS tests collected.
   - Ruff, Mypy, Prettier, git diff --check clean.
-- **Status:** Independently approved by Gemini 4 Hydrogen (`APPROVED — T12-AUDIT-01 CORRECTION READY FOR ONE LOCAL COMMIT`); finalized in a single local corrective commit; remote CI verification on live PostgreSQL still pending push.
+- **Status:** **T12-AUDIT-01 REMOTELY VERIFIED IN CI RUN 46102340989 (16 LIVE RLS TESTS PASSED, 0 SKIPS); FOLLOW-ON CONTROLS T12-FIX-03..07 IMPLEMENTED LOCALLY AND VERIFIED (771 OFFLINE TESTS PASSED, 0 COMMITS, 0 PUSHES)**
+
+### 5.9 T12-AUDIT-01 Remote CI Verification Evidence (Run 46102340989)
+- **Commit SHA:** `3e02f16ec513fcbb81dd9a0d1eb5725cb1c4c0c3`
+- **Parent Commit SHA:** `91fd909435031103b0da2df4952154007660022e`
+- **Branch:** `feature/t12-implementation`
+- **GitHub Actions Run ID:** [46102340989](https://github.com/manishkr6/dormiostay/actions/runs/46102340989)
+- **Workflow Status & Conclusion:** `completed` / **`success`**
+- **Job Inventory:**
+  - `web` (ID `140847367777`): **`success`** — Lint, format, typecheck, build, 84 unit tests passed.
+  - `mobile` (ID `140847367977`): **`success`** — Lint, typecheck, config verification, 88 unit tests passed.
+  - `api` (ID `140847368009`): **`success`** — PostgreSQL 16 container, migrations, 16 live RLS tests passed (0 skips), 745 offline tests passed.
+- **Live Engine Results:**
+  - Disposable `postgres:16-alpine` started healthy.
+  - Role `dormiostay_app` provisioned with non-elevated attributes.
+  - Alembic migrations `0001_foundation` -> `0002_email_outbox` -> `0003_row_level_security` passed cleanly.
+  - Exactly **16 live RLS integration tests passed, 0 failed, 0 skipped**.
+  - Exactly **43 cumulative policies verified in live catalog** (`test_postgres_rls_exact_cumulative_policy_inventory` PASSED).
+  - Clean `audit_logs` policy catalog verified (`test_postgres_rls_audit_logs_policy_catalog_clean` PASSED): only `audit_logs_insert` and `audit_logs_select` exist; legacy permissive policies absent.
+  - System context audit INSERT succeeded without `RETURNING id` (`test_postgres_rls_system_context_audit_logs_insert_permitted` PASSED).
+  - Admin UPDATE and DELETE independently denied with genuine SQLSTATE `42501` without transaction abort cascades (`25P02`), and record immutability confirmed (`test_postgres_rls_audit_logs_update_delete_denied` PASSED).
+- **Remote CI Verdict:** `CI PASSED — T12-AUDIT-01 CORRECTION REMOTELY VERIFIED`.
+
+### 5.10 T12-FIX-05 Implementation: Historical Gate 4 Writer Quarantine
+- **Problem & Vulnerability:** The historical Gate 4 grant script (`execute_gate4_grants_async` and `apps/api/scripts/execute_gate4_grants.py`) was designed for T-05's zero-table-grant baseline. If accidentally executed against staging or production after migration 0003, it would unconditionally execute `REVOKE ALL PRIVILEGES ON TABLE public."{tbl}" FROM dormiostay_app` on all 11 application tables and `alembic_version`, instantly stripping all runtime table grants established by `0003_row_level_security.py` and taking down the API service.
+- **Architectural Remediation:**
+  1. In `apps/api/app/db/grant_guard.py`: Retired the mutation runner. `execute_gate4_grants_async` now raises `RuntimeError("GATE4_MUTATION_RETIRED")` immediately before evaluating target connections, reading credentials, or executing SQL.
+  2. In `apps/api/scripts/execute_gate4_grants.py`: CLI entry point raises `SystemExit("GATE4_MUTATION_RETIRED")` immediately.
+  3. In `apps/api/scripts/grant_application_role.sql`: Documented that direct manual SQL execution is strictly prohibited.
+  4. In `apps/api/tests/unit/test_gate4_grant_guard.py`: Updated test suite to verify that both the callable and CLI refuse execution before touching database connections or checking environment variables.
+
+### 5.11 T12-FIX-04 Implementation: Revision-Aware Security Catalog Verifier
+- **Problem:** Verification of PostgreSQL security state required a deterministic, reproducible catalog comparison capable of detecting any unexpected grant, policy, trigger, rule, column, or relation modification across revisions 0001 and 0003.
+- **Architectural Remediation:**
+  1. Implemented `apps/api/app/db/security_catalog.py`:
+     - Queries 22 PostgreSQL system catalogs and namespaces (`pg_class`, `pg_policy`, `pg_trigger`, `pg_proc`, `pg_attribute`, `pg_constraint`, `pg_namespace`, `pg_database`, `pg_roles`, `pg_auth_members`, `pg_default_acl`, `pg_db_role_setting`, etc.).
+     - Strictly enforces PostgreSQL 16 server catalog version (`int(version) // 10000 == 16`) and standard search path (`pg_catalog, public`).
+     - Serializes catalog state to deterministic, sorted JSON lines.
+  2. Defined Canonical Manifests:
+     - `apps/api/app/db/security_manifests/foundation.jsonl`: Baseline manifest for revision `0001_foundation`.
+     - `apps/api/app/db/security_manifests/rls.delta`: Delta manifest representing exact structural and security changes introduced by `0003_row_level_security.py` (drops 2 permissive policies, adds 43 RLS policies, adds trigger `protect_users_sensitive_columns`, grants table permissions to `dormiostay_app`, adds `email_outbox` table and columns).
+  3. Fail-Closed Verification (`verify_catalog`):
+     - Compares observed live catalog against `manifest(revision)`.
+     - Verifies `alembic_version` contains exactly `[revision]`.
+     - Fails closed on any schema drift, unexpected grant, or missing security attribute without leaking sensitive expressions in logs.
+  4. Automated Tests:
+     - Unit tests in `apps/api/tests/unit/test_t12_catalog_manifest.py`: Verifies manifest parsing, 43 policies across 12 tables, table grant distributions, and audit policy names.
+     - Integration tests in `apps/api/tests/integration/t12/test_catalog.py`: 13 drift scenarios (alembic_version manipulation, role rename, elevated privileges, public grants, extra columns, column type change, dropped columns, disabled RLS, disabled triggers, altered policies).
+
+### 5.12 T12-FIX-06 Implementation: Recovery Contract and Snapshot Rehearsal Validation
+- **Problem:** Staging and production migrations require cryptographic and evidentiary proof of recovery readiness (pre-migration snapshot, independent rehearsal verification, write freeze) without granting automated agent tools permission to create or restore Neon cloud snapshots.
+- **Architectural Remediation:**
+  1. Implemented `apps/api/app/db/recovery.py`:
+     - `RecoveryEvidence` Pydantic model with strict field validation:
+       - Pinned to approved staging identifiers (`project: "small-dew-81510029"`, `source_branch: "br-weathered-dust-bim5fibs"`, `endpoint: "ep-cold-smoke-bir1s74t"`, `database: "neondb"`, `revision: "0001_foundation"`).
+       - Enforces timeline invariants: `captured_at <= rehearsed_at <= approved_at <= now < expires_at <= retained_until`.
+       - Enforces release window validity: `expires_at - captured_at <= 24 hours`.
+       - Enforces two-person separation of duties: `recovery_owner != independent_approver`.
+       - Rejects ineligible snapshot artifacts and prohibited rehearsal branches (`br-holy-lake-bi0hc1lu`, source branch).
+  2. Implemented `foundation_fingerprint(connection)`:
+     - Executes under `REPEATABLE READ READ ONLY`, `row_security=off`, and UTC timezone.
+     - Streams JSON representation of all rows across the 11 application tables ordered by `id` and computes SHA-256 fingerprint.
+  3. Implemented `verify_isolated_rehearsal(source, rehearsal, evidence)`:
+     - Compares separately authenticated source and restored rehearsal sessions.
+     - Confirms read-only snapshots on both connections.
+     - Enforces distinct database destinations (`source_name != restore_name`).
+     - Verifies baseline catalog and exact byte-for-byte fingerprint equality.
+  4. Automated Tooling & Tests:
+     - CLI validator: `apps/api/scripts/check_recovery_evidence.py`.
+     - Unit tests: `apps/api/tests/unit/test_t12_recovery.py` (8 passed).
+     - Integration test: `apps/api/tests/integration/t12/test_recovery.py` (rehearsal data perturbation detection).
+
+### 5.13 T12-FIX-03 Implementation: Gate 3b Incremental Migration Runner
+- **Problem:** Safe execution of migrations 0001 -> 0003 requires exclusive transaction control, explicit advisory locking, physical connection pinning, fail-closed handling of ambiguous commit outcomes, and cryptographic release binding.
+- **Architectural Remediation:**
+  1. Implemented `apps/api/app/db/gate3b.py`:
+     - Session advisory lock on `LOCK_KEY = 731203` with pre- and post-operation session verification (`_check_session`).
+     - Physical connection pinning: SQLAlchemy event listener on `do_connect` forbids replacement physical connections (`refuse_reconnect`), guaranteeing session GUCs and locks cannot be silently lost across reconnection.
+     - Dedicated Alembic runner `apps/api/app/db/gate3b_env/env.py`: Executes migrations strictly in a single online transaction without intermediate commits (`transactional_ddl=True, transaction_per_migration=False`), verifies starting revision is `0001_foundation`, verifies destination is `0003_row_level_security`, and enforces loopback connection.
+     - Ambiguous commit fail-closed handling: If commit acknowledgement is lost or ambiguous, raises `CommitOutcomeUnknown` and records `"unknown"` outcome in custodian ledger; automatic retries are strictly prohibited.
+  2. Implemented Release Contract in `apps/api/app/db/release_contract.py`:
+     - `ReleaseBinding` and `ReleaseDecision` models binding Git commit, branch, workflow digest, dependency digest (`pyproject.toml`, `requirements.txt`), manifest digest (`foundation.jsonl`, `rls.delta`), and recovery evidence digest.
+     - Custodian durable ledger (`consume_at_custodian`, `record_outcome`): Enforces single-use consumption of release decisions via SQLite primary key constraints (`PRIMARY KEY(repository, run_id)`).
+  3. Safe Quarantined Boundaries:
+     - Standalone script `apps/api/scripts/gate3b.py` raises `SystemExit("GATE3B_DISABLED...")` unconditionally.
+     - Boundary module `apps/api/app/db/gate3b_identity.py` raises `RuntimeError("Provider-issued session branch and endpoint binding unavailable")`.
+  4. Automated Tests:
+     - Unit tests: `apps/api/tests/unit/test_t12_release_contract.py` (7 passed).
+     - Integration tests: `apps/api/tests/integration/t12/test_gate3b.py` (contention, atomic failure rollback, precommit interruption, pre-DDL recheck, isolated rehearsal upgrade, populated upgrade and lost ack).
+
+### 5.14 T12-FIX-07 Implementation: Render Staging Readiness & Secret Hygiene
+- **Problem:** Render staging configuration must be independently verified to ensure proper database pooling, strict TLS, unprivileged runtime roles, zero Git-stored secrets, and fail-closed service disabling (`AUTH_ENDPOINTS_ENABLED = 'false'`).
+- **Architectural Remediation:**
+  1. Updated `render.yaml`:
+     - Added explicit `AUTH_ENDPOINTS_ENABLED: 'false'`.
+     - Preserved `APP_ENV: staging`, `PYTHON_VERSION: 3.12.9`.
+     - Confirmed sensitive credentials (`DATABASE_URL`, `FRONTEND_ORIGIN`) use `sync: false` and are never stored in Git.
+  2. Implemented `apps/api/app/db/render_readiness.py`:
+     - `RenderInventory` model: Validates password-free staging inventory (verifies pooler hostname, `sslmode: verify-full`, database `neondb`, role `dormiostay_app`, port 5432).
+     - Fails closed if `auth_endpoints_enabled`, `worker_enabled`, `api_proxy_enabled`, or `migration_credentials_present` is True.
+     - `verify_runtime_session`: Inspects read-only session state and asserts `dormiostay_app` runtime role.
+  3. Automated Tooling & Tests:
+     - CLI validator: `apps/api/scripts/check_render_evidence.py`.
+     - Unit tests in `apps/api/tests/unit/test_t12_render_readiness.py` (11 passed).
+     - Frontend blueprint tests in `apps/web/config/render-routes.test.ts` (10 passed).
+
+### 5.15 Legacy Integration Test Alignment & Metadata Registration
+- **Alembic Metadata Registration (`apps/api/alembic/env.py`):**
+  - Registered `EmailBase.metadata` alongside `Base.metadata` (`target_metadata=[Base.metadata, EmailBase.metadata]`), ensuring Alembic autogenerate and diff inspections recognize `EmailOutbox`.
+- **Database Integration Test Alignment (`apps/api/tests/integration/test_database.py`):**
+  - `test_actual_application_login`: Updated to verify that unauthenticated guest context `INSERT INTO audit_logs` fails with SQLSTATE `42501` under RLS policy `audit_logs_insert`, and verified that system context (`role="system"`) succeeds.
+  - `test_ordinary_application_role_audit_permissions`: Updated to verify that missing context `INSERT INTO audit_logs` fails with SQLSTATE `42501` inside a savepoint (`connection.begin_nested()`), and verified that `set_config('app.role', 'system', true)` succeeds.
+
+### 5.16 Mypy Duplicate Module Resolution & Test Suite Idempotency Remediation
+- **Mypy Duplicate Module Fix:**
+  - `pyproject.toml` configured `files = ["app", "tests", "alembic"]`. When mypy discovered `apps/api/tests/conftest.py` and `apps/api/tests/integration/t12/conftest.py` without package boundaries, both mapped to top-level module `"conftest"`.
+  - Resolution: Added package marker `__init__.py` files to `tests/`, `tests/integration/`, and `tests/integration/t12/`. Mypy now passes with 0 errors across all 87 source files.
+- **Gate 3b Integration Test Idempotency Fix (`test_gate3b.py`):**
+  - Incident: `test_isolated_rehearsal_comparison_and_acknowledged_upgrade` initially passed on fresh databases, but a subsequent run failed with 23 passed, 1 failed (`verify_catalog(rehearsal, FOUNDATION)` mismatch).
+  - Root Cause: The test committed `other` (`dormiostay_t03_test_rehearsal`) to `DESTINATION` (`0003_row_level_security`). On subsequent runs against the same container without database recreation, `dormiostay_t03_test_rehearsal` was already at revision 0003, causing foundation fingerprint verification to fail.
+  - Minimal Correction: Implemented `_reset_to_foundation(engine)` in `apps/api/tests/integration/t12/test_gate3b.py`. Before and after running the test (in a `finally:` block), if the database is at `0003_row_level_security`, it executes `mod_0003.DOWNGRADE_STATEMENTS`, `mod_0002.DOWNGRADE_STATEMENTS`, resets `alembic_version` to `'0001_foundation'`, and purges test fixtures from `amenities`. Applied the same reset to `test_populated_upgrade_and_lost_ack`. Both tests now execute cleanly and idempotently across multiple invocations.
 
 ---
 
-## 6. Verification Results
+## 6. Comprehensive Verification Results
 
-All local verification suites were executed:
+All local verification suites were executed after the final code edit:
 
 | Test / Check Suite | Target Command | Result |
 |:---|:---|:---:|
-| **T12-FIX-02 Regression Suite** | `pytest apps/api/tests/unit/test_t12_migration_role_guard.py` | **17 passed** |
-| **T12-FIX-01 Regression Suite** | `pytest apps/api/tests/unit/test_t12_session_identity_fail_closed.py` | **9 passed** |
-| **CI-02-SEC-01 Regression Suite** | `pytest apps/api/tests/unit/test_t12_ci_database_env.py` | **13 passed, 1 warning** |
-| **Security Test Suite** | `pytest apps/api/tests/security` | **62 passed, 16 skipped, 1 warning** |
-| **T-05 Staging Gate Suite** | `pytest apps/api/tests/unit/test_t05*` | **88 passed** |
-| **T-05 Guard Suite** | `pytest apps/api/tests/unit/test_deployment_config.py ...` | **129 passed, 15 warnings** |
-| **Auth Regressions (T-06..T-11)** | `pytest apps/api/tests/unit/test_t06* .. test_t11*` | **205 passed, 1 warning** |
-| **Full Backend Offline Suite** | `pytest apps/api/tests/unit apps/api/tests/security` | **745 passed, 16 skipped, 15 warnings** |
-| **Frontend Web Tests** | `pnpm --filter @dormiostay/web test` | **84 passed** |
-| **Frontend Mobile Tests** | `pnpm --filter @dormiostay/mobile test` | **88 passed** |
-| **Frontend Web Build** | `pnpm --filter @dormiostay/web build` | **Success (dist/index.html)** |
-| **Mobile Config Check** | `npm run config:mobile` | **All Expo variants verified** |
-| **Python Ruff Lint** | `ruff check apps/api` | **Clean (0 errors across 73 files)** |
-| **Python Ruff Format** | `ruff format --check apps/api` | **Clean (73 files formatted)** |
-| **Strict Mypy Typecheck** | `mypy apps/api` | **Success: 0 errors across 73 source files** |
-| **Prettier Formatting** | `npm run format:check` | **Clean (All matched files use Prettier code style)** |
-| **Git Whitespace Check** | `git diff --check` | **Clean (0 errors)** |
+| **T12-FIX-03 Release Contract Unit Suite** | `pytest apps/api/tests/unit/test_t12_release_contract.py` | **7 passed** |
+| **T12-FIX-04 Catalog Manifest Unit Suite** | `pytest apps/api/tests/unit/test_t12_catalog_manifest.py` | **1 passed** |
+| **T12-FIX-05 Gate 4 Grant Guard Unit Suite** | `pytest apps/api/tests/unit/test_gate4_grant_guard.py` | **41 passed** |
+| **T12-FIX-06 Recovery Contract Unit Suite** | `pytest apps/api/tests/unit/test_t12_recovery.py` | **8 passed** |
+| **T12-FIX-07 Render Readiness Unit Suite** | `pytest apps/api/tests/unit/test_t12_render_readiness.py` | **11 passed** |
+| **T12-FIX-01 Session Identity Unit Suite** | `pytest apps/api/tests/unit/test_t12_session_identity_fail_closed.py` | **9 passed** |
+| **T12-FIX-02 Migration Role Guard Unit Suite** | `pytest apps/api/tests/unit/test_t12_migration_role_guard.py` | **17 passed** |
+| **CI-02-SEC-01 Test DB Env Unit Suite** | `pytest apps/api/tests/unit/test_t12_ci_database_env.py` | **13 passed, 1 warning** |
+| **Full Security Test Suite** | `pytest apps/api/tests/security` | **62 passed, 16 skipped, 1 warning** |
+| **Full Unit Test Suite** | `pytest apps/api/tests/unit` | **709 passed, 15 warnings** |
+| **Combined Backend Offline Test Suite** | `pytest apps/api/tests/unit tests/security tests/integration` | **771 passed, 44 skipped, 15 warnings** |
+| **Frontend Web Unit Suite** | `npm --prefix apps/web test` | **84 passed (6 test files)** |
+| **Frontend Web Build** | `npm --prefix apps/web run build` | **Success (`dist/index.html` 0.89 kB, JS 417 kB)** |
+| **Frontend Mobile Unit Suite** | `npm --prefix apps/mobile test` | **88 passed (10 test suites)** |
+| **Mobile Configuration Verification** | `npm run config:mobile` | **All Expo variants verified (dev, preview, prod)** |
+| **Frontend Web ESLint** | `npm --prefix apps/web run lint` | **Clean (0 errors, 0 warnings)** |
+| **Frontend Mobile ESLint** | `npm --prefix apps/mobile run lint` | **Clean (0 errors, 0 warnings)** |
+| **Python Ruff Lint** | `ruff check apps/api` | **Clean (0 errors across 94 files)** |
+| **Python Ruff Format** | `ruff format --check apps/api` | **Clean (94 files formatted)** |
+| **Strict Mypy Typecheck** | `mypy` (from `apps/api`) | **Success: 0 errors across 87 source files** |
+| **Root Prettier Formatting** | `npm run format:check` | **Clean (All matched files use Prettier style)** |
+| **Git Whitespace & Diff Check** | `git diff --check` | **Clean (0 errors)** |
 
 ---
 
@@ -461,24 +586,77 @@ All local verification suites were executed:
 
 1. **Gate Closure & Readiness Status:**
    - **Historical T-05 Gate 4:** APPROVED by Astra.
-   - **Neon Staging Migration:** **BLOCKED** pending implementation of incremental upgrade guard (`0001` -> `0003`), pre-T-12 snapshot creation, and Astra re-approval.
-   - **Render Staging Deployment:** **BLOCKED** pending staging API destination verification and successful database migration.
+   - **Neon Staging Migration:** **BLOCKED** pending external snapshot creation, independent security review, and authorization.
+   - **Render Staging Deployment:** **BLOCKED** pending staging database migration completion and external authorization.
 2. **Feature Ticket Dependencies:**
    - **T-13 (TOTP Admin MFA):** Admin MFA enforcement will be completed when T-13 provides trusted server-side MFA verification (`request.state.mfa_completed = True`).
    - **T-16 (Host Application & Onboarding):** Full host application status checks will be connected when T-16 creates the `host_applications` table.
-3. **Public Auth Activation Guard:** `auth_endpoints_enabled` remains set to `False` in application configuration.
+3. **Public Auth Activation Guard:** `auth_endpoints_enabled` remains set to `False` in application configuration and `render.yaml`.
 
 ---
 
 ## 8. Git Inventory & Review Baseline
 
 - **Active Branch:** `feature/t12-implementation`
-- **Starting Commit (Parent HEAD):** `91fd909435031103b0da2df4952154007660022e` (`fix(security): drop legacy permissive audit policies in migration 0003`)
-- **Remote Synchronization:** Up to date with `origin/feature/t12-implementation`.
-- **Working Tree Inventory (T12-AUDIT-01 transaction-isolation correction):**
-  - Tracked modifications (2):
-    - `apps/api/tests/security/test_postgres_rls_integration.py`
-    - `docs/T-12 Verification Report.md`
-  - Untracked files: `0`.
-- **Staged Changes:** Ready for single local corrective commit.
-- **Commit Closure:** Finalizing exactly one local commit with message `test(security): isolate audit RLS mutation checks in PostgreSQL transactions`.
+- **Committed HEAD:** `3e02f16ec513fcbb81dd9a0d1eb5725cb1c4c0c3` (`test(security): isolate audit RLS mutation checks in PostgreSQL transactions`)
+- **Remote Synchronization:** In sync with `origin/feature/t12-implementation`.
+- **Working Tree Inventory:**
+  - **11 Modified Tracked Files:**
+    1. `.github/workflows/ci.yml`: Isolated PostgreSQL 16 Gate 3b acceptance step.
+    2. `apps/api/alembic/env.py`: Registered `EmailBase.metadata` in `target_metadata`.
+    3. `apps/api/app/db/grant_guard.py`: Retired Gate 4 grant mutation runner (`GATE4_MUTATION_RETIRED`).
+    4. `apps/api/app/db/migration_guard.py`: Added `require_read_write` parameter for staging control plane.
+    5. `apps/api/scripts/execute_gate4_grants.py`: Retired CLI entry point (`GATE4_MUTATION_RETIRED`).
+    6. `apps/api/scripts/grant_application_role.sql`: Direct SQL execution prohibited notice.
+    7. `apps/api/tests/integration/test_database.py`: Updated audit insert assertions to expect 42501 for guest/missing context.
+    8. `apps/api/tests/unit/test_gate4_grant_guard.py`: Updated tests for retired callable and CLI.
+    9. `apps/web/config/render-routes.test.ts`: Added assertions for `AUTH_ENDPOINTS_ENABLED: 'false'`.
+    10. `render.yaml`: Added `AUTH_ENDPOINTS_ENABLED: 'false'`.
+    11. `docs/T-12 Verification Report.md`: Comprehensive T-12 audit and remediation report.
+  - **23 Untracked Files:**
+    1. `apps/api/app/db/gate3b.py`: Gate 3b incremental upgrade orchestrator.
+    2. `apps/api/app/db/gate3b_env/env.py`: Dedicated Alembic env wrapper for Gate 3b.
+    3. `apps/api/app/db/gate3b_identity.py`: Fail-closed provider identity boundary.
+    4. `apps/api/app/db/recovery.py`: Recovery evidence model and fingerprinting.
+    5. `apps/api/app/db/release_contract.py`: Release binding, decision, and ledger.
+    6. `apps/api/app/db/render_readiness.py`: Render staging environment verification.
+    7. `apps/api/app/db/security_catalog.py`: PostgreSQL catalog query extractor and manifest comparator.
+    8. `apps/api/app/db/security_manifests/foundation.jsonl`: Catalog manifest baseline for revision 0001.
+    9. `apps/api/app/db/security_manifests/rls.delta`: Catalog manifest delta for revision 0003.
+    10. `apps/api/scripts/check_recovery_evidence.py`: CLI for verifying recovery evidence files.
+    11. `apps/api/scripts/check_render_evidence.py`: CLI for verifying Render blueprint evidence.
+    12. `apps/api/scripts/gate3b.py`: Standalone CLI for running Gate 3b (quarantined).
+    13. `apps/api/tests/__init__.py`: Package init resolving mypy module naming.
+    14. `apps/api/tests/integration/__init__.py`: Package init resolving mypy module naming.
+    15. `apps/api/tests/integration/t12/__init__.py`: Package init resolving mypy module naming.
+    16. `apps/api/tests/integration/t12/conftest.py`: Loopback test fixtures for Gate 3b and integration tests.
+    17. `apps/api/tests/integration/t12/test_catalog.py`: Catalog manifest verification tests for 0001 and 0003.
+    18. `apps/api/tests/integration/t12/test_gate3b.py`: Gate 3b integration tests with reset fixture.
+    19. `apps/api/tests/integration/t12/test_recovery.py`: Recovery rehearsal tests.
+    20. `apps/api/tests/unit/test_t12_catalog_manifest.py`: Unit tests for catalog extraction.
+    21. `apps/api/tests/unit/test_t12_recovery.py`: Unit tests for snapshot/recovery verification.
+    22. `apps/api/tests/unit/test_t12_release_contract.py`: Unit tests for release contract transitions.
+    23. `apps/api/tests/unit/test_t12_render_readiness.py`: Unit tests for Render blueprint configuration.
+- **Zero New Commits or Pushes:** The working tree contains zero newly created commits or remote pushes. Ready for independent security review.
+
+---
+
+## 9. Proposed Ticket-by-Ticket Commit & Independent Review Plan
+
+Once independent review is completed and approved, the changes should be committed in the following logical sequence:
+
+1. **Commit 1 (T12-FIX-05):** `fix(security): quarantine historical Gate 4 grant mutation runners` (4 files)
+   - Files: `apps/api/app/db/grant_guard.py`, `apps/api/scripts/execute_gate4_grants.py`, `apps/api/scripts/grant_application_role.sql`, `apps/api/tests/unit/test_gate4_grant_guard.py`.
+2. **Commit 2 (T12-FIX-04):** `feat(security): implement revision-aware PostgreSQL catalog manifest verifier` (9 files)
+   - Files: `apps/api/app/db/security_catalog.py`, `apps/api/app/db/security_manifests/foundation.jsonl`, `apps/api/app/db/security_manifests/rls.delta`, `apps/api/tests/unit/test_t12_catalog_manifest.py`, `apps/api/tests/integration/t12/test_catalog.py`, `apps/api/tests/integration/t12/conftest.py`, `apps/api/tests/integration/t12/__init__.py`, `apps/api/tests/integration/__init__.py`, `apps/api/tests/__init__.py`.
+   - *Dependency note:* Includes `conftest.py` (engine and target fixtures) and package `__init__.py` markers so `test_catalog.py` executes cleanly and mypy detects no duplicate `conftest` module errors.
+3. **Commit 3 (T12-FIX-06):** `feat(security): implement recovery evidence contract and snapshot rehearsal validator` (4 files)
+   - Files: `apps/api/app/db/recovery.py`, `apps/api/scripts/check_recovery_evidence.py`, `apps/api/tests/unit/test_t12_recovery.py`, `apps/api/tests/integration/t12/test_recovery.py`.
+   - *Dependency note:* Depends on `grant_guard` (Commit 1), `security_catalog` (Commit 2), and `conftest.py` (Commit 2).
+4. **Commit 4 (T12-FIX-03):** `feat(security): implement Gate 3b incremental migration runner with advisory locking` (9 files)
+   - Files: `apps/api/app/db/gate3b.py`, `apps/api/app/db/gate3b_env/env.py`, `apps/api/app/db/gate3b_identity.py`, `apps/api/app/db/migration_guard.py`, `apps/api/app/db/release_contract.py`, `apps/api/scripts/gate3b.py`, `apps/api/tests/integration/t12/test_gate3b.py`, `apps/api/tests/unit/test_t12_release_contract.py`, `.github/workflows/ci.yml`.
+   - *Dependency note:* `test_gate3b.py` depends on `security_catalog` (Commit 2) and `recovery` (Commit 3). `.github/workflows/ci.yml` introduces the Gate 3b step running `pytest tests/integration/t12 -v`, which tests all three integration test files now present in the tree.
+5. **Commit 5 (T12-FIX-07):** `fix(render): enforce AUTH_ENDPOINTS_ENABLED false in Render blueprint and readiness check` (5 files)
+   - Files: `render.yaml`, `apps/api/app/db/render_readiness.py`, `apps/api/scripts/check_render_evidence.py`, `apps/web/config/render-routes.test.ts`, `apps/api/tests/unit/test_t12_render_readiness.py`.
+6. **Commit 6 (T12-INTEGRATION):** `test(integration): register EmailOutbox metadata and align legacy audit tests` (3 files)
+   - Files: `apps/api/alembic/env.py`, `apps/api/tests/integration/test_database.py`, `docs/T-12 Verification Report.md`.

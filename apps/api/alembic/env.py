@@ -15,6 +15,7 @@ from app.db.migration_guard import (
     verify_migration_connection,
 )
 from app.db.models import Base
+from app.db.models.email_outbox import EmailBase
 
 load_dotenv()
 direct_url = os.environ.get("DATABASE_URL_DIRECT")
@@ -47,7 +48,7 @@ if not test_approved and migration_action == "downgrade":
 def migrate(connection: Connection) -> None:
     context.configure(
         connection=connection,
-        target_metadata=Base.metadata,
+        target_metadata=[Base.metadata, EmailBase.metadata],
         compare_type=True,
     )
     with context.begin_transaction():
@@ -69,7 +70,7 @@ async def online() -> None:
 if context.is_offline_mode():
     context.configure(
         url=target,
-        target_metadata=Base.metadata,
+        target_metadata=[Base.metadata, EmailBase.metadata],
         literal_binds=True,
     )
     with context.begin_transaction():
