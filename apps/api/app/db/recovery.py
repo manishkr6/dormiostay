@@ -76,8 +76,11 @@ async def foundation_fingerprint(connection: AsyncConnection) -> str:
         result = await connection.stream(
             text(f'SELECT to_jsonb(t)::text FROM public."{table}" t ORDER BY t.id')
         )
-        async for row in result:
-            digest.update(row[0].encode() + b"\n")
+        try:
+            async for row in result:
+                digest.update(row[0].encode() + b"\n")
+        finally:
+            await result.close()
     return digest.hexdigest()
 
 

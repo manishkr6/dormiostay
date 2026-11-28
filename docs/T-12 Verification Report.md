@@ -3,9 +3,9 @@
 - **Date:** 2026-11-28 (Asia/Kolkata)
 - **Ticket:** T-12 — Role permissions and row-level security
 - **Branch:** `feature/t12-implementation`
-- **Base Commit / Parent HEAD:** `c9e81071c10c4b3df5008ef2dadc7b1dee509eb3` (`test(integration): register EmailOutbox metadata and align legacy audit tests`)
-- **Remote Synchronization:** In sync with `origin/feature/t12-implementation` (6 pushed commits).
-- **Status:** **T12-CI-FIX-01 LOCAL CORRECTIVE COMMIT CREATED — READY FOR CONTROLLED PRE-PUSH VERIFICATION (1 LOCAL COMMIT, 0 PUSHES)**
+- **Base Commit / Parent HEAD:** `53040a8875048ee4bc3789cb3d535b014a4f127d` (`fix(ci): correct isolated Gate 3b PostgreSQL test setup`)
+- **Remote Synchronization:** In sync with `origin/feature/t12-implementation` (7 pushed commits: 6 approved T-12 commits + 1 corrective CI commit).
+- **Status:** **T12-CI-FIX-02 LOCAL CORRECTIVE COMMIT CREATED — READY FOR CONTROLLED PRE-PUSH VERIFICATION (1 LOCAL COMMIT, 0 PUSHES)**
 
 ---
 
@@ -27,7 +27,8 @@ Across three independent Gemini 4 Hydrogen architectural and security reviews, e
 | **T12-SEC-10** | `MEDIUM` | **RECONCILED** | Hydrogen review alleged GUC parameter name mismatch (`app.current_user_id` vs `app.user_id`). | Source audit confirmed both `session.py` and migration `0003` already use canonical names `app.user_id` and `app.role` exclusively. Added negative tests for malformed/unset GUCs and verification of exact names. | Verified via `test_guc_parameters_exact_canonical_names` and `test_negative_malformed_roles_rejected`. |
 | **T12-SEC-11** | `HIGH` | **RESOLVED** | Duplicate step block in `.github/workflows/ci.yml` causing step redundancy and root Prettier check failure. | Removed the redundant duplicate step block in `.github/workflows/ci.yml` and formatted with Prettier. | Verified via `npm run format:check` (clean, 0 errors) and YAML syntax check. |
 | **T12-AUDIT-01** | `CRITICAL` | **RESOLVED** | Inherited foundation policy `audit_insert` with `WITH CHECK (true)` survived migration 0003, resulting in 45 policies and bypassing audit log write restrictions via permissive OR composition. | Added explicit `DROP POLICY IF EXISTS audit_insert` and `audit_admin_read` in migration 0003 upgrade, restored them in downgrade while preserving RLS, and added 12 new static/live tests. | Verified via 14 static RLS tests, 16 live RLS integration tests, and exact 43-policy catalog assertion. |
-| **T12-CI-FIX-01** | `HIGH` | **RESOLVED** | CI Step "Gate 3b acceptance on isolated PostgreSQL 16" setup failed with `MIGRATION_FAILED: inspect schema and privileges; details suppressed` during `alembic upgrade 0001_foundation` in workflow run 46124476984. | Root cause analysis: In `alembic/env.py`, `online()` catches any unhandled `Exception` and emits `MIGRATION_FAILED: inspect schema and privileges; details suppressed`, leaving the exact underlying exception unobserved in the CI log. The deduced causal mechanism is that `loopback()` executed `sudo nsenter --target "$service_pid" --net -- setpriv ... --clear-groups`, which sanitized runner environment variables (`HOME=/root`, stripped `PATH`, no `uv` virtualenv context) and executed `.venv/bin/alembic` outside the managed environment. Furthermore, container network namespace switching is unnecessary for provisioning commands. Decoupling provisioning to run directly against `localhost:5432` via `uv run alembic upgrade 0001_foundation` matches proven step 49, while `loopback()` is preserved for `pytest tests/integration/t12` using `sudo -E nsenter` with explicit `PATH` and `HOME`. | Verified via full local regression suite: 771 passed backend tests, 84 passed web tests, 88 passed mobile tests, Ruff clean, Mypy clean (87 source files), Prettier clean, zero diff whitespace errors. |
+| **T12-CI-FIX-01** | `HIGH` | **RESOLVED** | CI Step "Gate 3b acceptance on isolated PostgreSQL 16" setup failed with `MIGRATION_FAILED: inspect schema and privileges; details suppressed` during `alembic upgrade 0001_foundation` in workflow run 46124476984. | Root cause analysis: In `alembic/env.py`, `online()` catches any unhandled `Exception` and emits `MIGRATION_FAILED: inspect schema and privileges; details suppressed`, leaving the exact underlying exception unobserved in the CI log. The deduced causal mechanism is that `loopback()` executed `sudo nsenter --target "$service_pid" --net -- setpriv ... --clear-groups`, which sanitized runner environment variables (`HOME=/root`, stripped `PATH`, no `uv` virtualenv context) and executed `.venv/bin/alembic` outside the managed environment. Furthermore, container network namespace switching is unnecessary for provisioning commands. Decoupling provisioning to run directly against `localhost:5432` via `uv run alembic upgrade 0001_foundation` matches proven step 49, while `loopback()` is preserved for `pytest tests/integration/t12` using `sudo -E nsenter` with explicit `PATH` and `HOME`. | Verified via full local regression suite: 771 passed backend tests, 84 passed web tests, 88 passed mobile tests, Ruff clean, Mypy clean (87 source files), Prettier clean, zero diff whitespace errors. Pushed in commit `53040a8875048ee4bc3789cb3d535b014a4f127d`. |
+| **T12-CI-FIX-02** | `HIGH` | **RESOLVED** | CI test `test_isolated_rehearsal_comparison_and_acknowledged_upgrade` failed in workflow run 46137634407 with `asyncpg.exceptions.ObjectInUseError: cannot ALTER TABLE "users" because it is being used by active queries in this session` on statement `ALTER TABLE users ENABLE ROW LEVEL SECURITY`. | Root cause analysis: In `apps/api/app/db/gate3b.py`, `run_disposable()` invokes `approval.verify_recovery(conn)` inside the outer migration transaction immediately before running Alembic migrations (`conn.run_sync(upgrade_shared)`). In `apps/api/app/db/recovery.py`, `foundation_fingerprint()` iterated over `APPLICATION_TABLES` (ending with `users`) using `connection.stream()` without awaiting `result.close()`. The asyncpg server-side portal on `users` remained open in the transaction, causing PostgreSQL's `CheckTableNotInUse` to reject the subsequent `ALTER TABLE users ENABLE ROW LEVEL SECURITY` DDL with SQLSTATE `55P03`. Remediation: Wrapped streaming iteration in `try ... finally: await result.close()`, guaranteeing immediate deterministic closure of the server-side cursor/portal for each table, preserving ordered streaming and bounded memory behavior. | Verified via 11 unit tests in `test_t12_recovery.py` (including normal closure, exception closure, and cancellation closure), new integration test `test_foundation_fingerprint_releases_cursor_before_ddl`, 774 passed backend offline tests (16 skipped requiring live DB), web suite clean (84 passed), mobile suite clean (88 passed), Ruff/Mypy/Prettier clean. |
 
 ---
 
@@ -606,6 +607,71 @@ Under T-05's zero-table-grant baseline, `dormiostay_app` possesses zero default 
   - Zero modification to RLS policies or PostgreSQL table-level grants.
   - Gate 3b integration tests continue to run inside the container's network namespace via `loopback()`, validating `inet_server_addr() IN ('127.0.0.1', '::1')`.
 
+### 5.18 T12-CI-FIX-02: Active PostgreSQL Cursor During Migration (Run 46137634407)
+- **Incident Summary:**
+  Following the authorized push of commit `53040a8875048ee4bc3789cb3d535b014a4f127d`, GitHub Actions workflow run [46137634407](https://github.com/manishkr6/dormiostay/actions/runs/46137634407) executed:
+  - `web` job: **SUCCESS** (Lint, format check, TypeScript, 84 tests passed, build succeeded).
+  - `mobile` job: **SUCCESS** (Lint, TypeScript, 88 tests passed, Expo config dev/preview/prod verified).
+  - `api` job: **FAILURE** in step `Gate 3b acceptance on isolated PostgreSQL 16`.
+  - Database provisioning (`createdb`, role grants, and `alembic upgrade 0001_foundation` for all 3 databases) **succeeded completely**.
+  - 23 of 24 Gate 3b integration tests **passed** (all 13 catalog drift tests, contention and rollback, 4 atomic failure tests, 2 precommit interruption tests, pre-DDL recheck, populated upgrade and lost ack, rehearsal fingerprint).
+  - Single failure: `test_isolated_rehearsal_comparison_and_acknowledged_upgrade`:
+    `asyncpg.exceptions.ObjectInUseError: cannot ALTER TABLE "users" because it is being used by active queries in this session`
+    Failing statement: `ALTER TABLE users ENABLE ROW LEVEL SECURITY` (in `0003_row_level_security.py:444`).
+
+- **Root Cause & Protocol Lifecycle Analysis:**
+  1. **Lifecycle Tracing:**
+     In `apps/api/app/db/gate3b.py`, `run_disposable(target, database, approval)` manages the migration workflow. Lines 133–148 execute:
+     ```python
+     tx = await conn.begin()
+     try:
+         ...
+         if approval:
+             await approval.verify_recovery(conn)
+         await conn.execute(text("SET LOCAL search_path=public"))
+         await conn.run_sync(upgrade_shared, database)
+     ```
+     `test_isolated_rehearsal_comparison_and_acknowledged_upgrade` is the only test that provides `approval=envelope`. Inside `approval.verify_recovery(conn)`, `foundation_fingerprint(conn)` is called (`apps/api/app/db/recovery.py`).
+  2. **Streaming Cursor / Portal Leak:**
+     In `foundation_fingerprint()`, tables from `APPLICATION_TABLES` (11 tables; `"users"` is the 11th table) are iterated:
+     ```python
+     result = await connection.stream(
+         text(f'SELECT to_jsonb(t)::text FROM public."{table}" t ORDER BY t.id')
+     )
+     async for row in result:
+         digest.update(row[0].encode() + b"\n")
+     ```
+     In SQLAlchemy AsyncIO with asyncpg, `connection.stream()` executes with an `AsyncAdapt_asyncpg_ss_cursor` backed by an asyncpg `Cursor` (a server-side portal). Because `foundation_fingerprint()` iterated through `async for row in result:` without calling `await result.close()`, the `AsyncResult` was not explicitly closed and its server-side portal on `users` remained open in the transaction.
+  3. **PostgreSQL CheckTableNotInUse Assertion:**
+     Immediately following `verify_recovery()`, within the **exact same physical connection and active transaction**, Alembic began applying `0003_row_level_security.py`. Line 444 executed `ALTER TABLE users ENABLE ROW LEVEL SECURITY`. PostgreSQL's internal `CheckTableNotInUse` detected an active portal on table `users` in the current session and rejected the DDL with SQLSTATE `55P03`:
+     `ObjectInUseError: cannot ALTER TABLE "users" because it is being used by active queries in this session`.
+
+- **Architectural & Minimal Remediation in `apps/api/app/db/recovery.py`:**
+  - Wrapped `connection.stream()` iteration in a `try ... finally: await result.close()` block:
+    ```python
+    result = await connection.stream(
+        text(f'SELECT to_jsonb(t)::text FROM public."{table}" t ORDER BY t.id')
+    )
+    try:
+        async for row in result:
+            digest.update(row[0].encode() + b"\n")
+    finally:
+        await result.close()
+    ```
+  - **Invariants Preserved:**
+    1. Bounded memory: Does NOT load full tables into memory via `fetchall()`; rows continue to be streamed chunk-by-chunk.
+    2. Ordered SHA-256 fingerprint: Digests remain 100% deterministic and byte-identical.
+    3. Exception & Cancellation safety: `await result.close()` is guaranteed to execute whether rows are exhausted normally, an exception is raised, or `asyncio.CancelledError` occurs.
+    4. Transaction & Connection integrity: The same physical connection, advisory lock, and single outer migration transaction are strictly preserved.
+
+- **Regression Tests Added:**
+  1. Unit tests in `apps/api/tests/unit/test_t12_recovery.py`:
+     - `test_foundation_fingerprint_closes_all_cursors_normally`: Confirms all 11 table streams are closed when fingerprinting completes.
+     - `test_foundation_fingerprint_closes_cursor_on_exception`: Confirms streams are closed even when an exception is raised during consumption.
+     - `test_foundation_fingerprint_closes_cursor_on_cancellation`: Confirms streams are closed even when `asyncio.CancelledError` is raised.
+  2. Integration test in `apps/api/tests/integration/t12/test_recovery.py`:
+     - `test_foundation_fingerprint_releases_cursor_before_ddl`: Begins an explicit transaction on `conn`, executes `await foundation_fingerprint(conn)`, immediately executes `ALTER TABLE users ENABLE ROW LEVEL SECURITY` within the exact same transaction, asserts successful DDL execution without `ObjectInUseError`, and rolls back cleanly in `finally`.
+
 ---
 
 ## 6. Comprehensive Verification Results
@@ -617,14 +683,14 @@ All local verification suites were executed after the final code edit:
 | **T12-FIX-03 Release Contract Unit Suite** | `pytest apps/api/tests/unit/test_t12_release_contract.py` | **7 passed** |
 | **T12-FIX-04 Catalog Manifest Unit Suite** | `pytest apps/api/tests/unit/test_t12_catalog_manifest.py` | **1 passed** |
 | **T12-FIX-05 Gate 4 Grant Guard Unit Suite** | `pytest apps/api/tests/unit/test_gate4_grant_guard.py` | **41 passed** |
-| **T12-FIX-06 Recovery Contract Unit Suite** | `pytest apps/api/tests/unit/test_t12_recovery.py` | **8 passed** |
+| **T12-FIX-06 Recovery Contract Unit Suite** | `pytest apps/api/tests/unit/test_t12_recovery.py` | **11 passed** (+3 new regression tests) |
 | **T12-FIX-07 Render Readiness Unit Suite** | `pytest apps/api/tests/unit/test_t12_render_readiness.py` | **11 passed** |
 | **T12-FIX-01 Session Identity Unit Suite** | `pytest apps/api/tests/unit/test_t12_session_identity_fail_closed.py` | **9 passed** |
 | **T12-FIX-02 Migration Role Guard Unit Suite** | `pytest apps/api/tests/unit/test_t12_migration_role_guard.py` | **17 passed** |
 | **CI-02-SEC-01 Test DB Env Unit Suite** | `pytest apps/api/tests/unit/test_t12_ci_database_env.py` | **13 passed, 1 warning** |
 | **Full Security Test Suite** | `pytest apps/api/tests/security` | **62 passed, 16 skipped, 1 warning** |
-| **Full Unit Test Suite** | `pytest apps/api/tests/unit` | **709 passed, 15 warnings** |
-| **Combined Backend Offline Test Suite** | `pytest apps/api/tests/unit tests/security tests/integration` | **771 passed, 44 skipped, 15 warnings** |
+| **Full Unit Test Suite** | `pytest apps/api/tests/unit` | **712 passed, 15 warnings** |
+| **Combined Backend Offline Test Suite** | `pytest apps/api/tests/unit tests/security tests/integration` | **774 passed, 44 skipped, 15 warnings** |
 | **Frontend Web Unit Suite** | `npm --prefix apps/web test` | **84 passed (6 test files)** |
 | **Frontend Web Build** | `npm --prefix apps/web run build` | **Success (`dist/index.html` 0.89 kB, JS 417 kB)** |
 | **Frontend Mobile Unit Suite** | `npm --prefix apps/mobile test` | **88 passed (10 test suites)** |
@@ -655,21 +721,23 @@ All local verification suites were executed after the final code edit:
 ## 8. Git Inventory & Review Baseline
 
 - **Active Branch:** `feature/t12-implementation`
-- **Committed HEAD:** `c9e81071c10c4b3df5008ef2dadc7b1dee509eb3` (`test(integration): register EmailOutbox metadata and align legacy audit tests`)
-- **Remote Synchronization:** In sync with `origin/feature/t12-implementation` (all 6 commits pushed).
-- **Working Tree Inventory (Local Changes for T12-CI-FIX-01):**
-  - **Exactly 2 Modified Tracked Files:**
-    1. `.github/workflows/ci.yml`: Decoupled Gate 3b database setup from `loopback()` namespace switching and preserved runner environment via `sudo -E` for test execution.
-    2. `docs/T-12 Verification Report.md`: Comprehensive documentation of T12-CI-FIX-01 incident, root cause, CI workflow correction, and local verification results.
+- **Committed HEAD:** `53040a8875048ee4bc3789cb3d535b014a4f127d` (`fix(ci): correct isolated Gate 3b PostgreSQL test setup`)
+- **Remote Synchronization:** In sync with `origin/feature/t12-implementation` (7 pushed commits: 6 approved T-12 commits + 1 CI corrective commit).
+- **Working Tree Inventory (Local Changes for T12-CI-FIX-02):**
+  - **Exactly 4 Modified Tracked Files:**
+    1. `apps/api/app/db/recovery.py`: Wrapped `connection.stream()` in `try ... finally: await result.close()`.
+    2. `apps/api/tests/integration/t12/test_recovery.py`: Added `test_foundation_fingerprint_releases_cursor_before_ddl` integration test.
+    3. `apps/api/tests/unit/test_t12_recovery.py`: Added 3 unit regression tests for normal, exception, and cancellation cursor closure.
+    4. `docs/T-12 Verification Report.md`: Comprehensive documentation of T12-CI-FIX-02 incident, root cause, deterministic cursor closing fix, and local verification results.
   - **Zero Untracked Files.**
   - **Zero Staged Files.**
 - **Zero New Commits or Pushes:** Local modifications only. No commits or pushes have been executed. Ready for independent review.
 
 ---
 
-## 9. Six-Commit Push Closure & Proposed Corrective Commit
+## 9. Seven-Commit Push Closure & Proposed Corrective Commit
 
-The six independently reviewed T-12 commits were authorized, committed locally, and pushed to `origin/feature/t12-implementation`:
+The six independently reviewed T-12 commits and the subsequent corrective commit `T12-CI-FIX-01` (`53040a8875048ee4bc3789cb3d535b014a4f127d`) are pushed to `origin/feature/t12-implementation`:
 
 1. **Commit 1 (`2ef8553`):** `fix(security): quarantine historical Gate 4 grant mutation runners` (4 files)
 2. **Commit 2 (`e31b371`):** `feat(security): implement revision-aware PostgreSQL catalog manifest verifier` (9 files)
@@ -677,24 +745,29 @@ The six independently reviewed T-12 commits were authorized, committed locally, 
 4. **Commit 4 (`dc9312d`):** `feat(security): implement Gate 3b incremental migration runner with advisory locking` (9 files)
 5. **Commit 5 (`1f0033f`):** `fix(render): enforce AUTH_ENDPOINTS_ENABLED false in Render blueprint and readiness check` (5 files)
 6. **Commit 6 (`c9e8107`):** `test(integration): register EmailOutbox metadata and align legacy audit tests` (3 files)
+7. **Commit 7 (`53040a8`):** `fix(ci): correct isolated Gate 3b PostgreSQL test setup` (2 files)
 
-Following remote CI verification (Workflow Run ID: `46124476984`), the single Gate 3b database setup failure (`T12-CI-FIX-01`) was resolved locally.
+Following remote CI verification of Commit 7 (Workflow Run ID: `46137634407`), the active cursor leak during migration (`T12-CI-FIX-02`) was investigated and resolved locally.
 
 Upon independent security review and explicit user authorization, the remediation is committed in exactly ONE local commit:
-- **Subject:** `fix(ci): correct isolated Gate 3b PostgreSQL test setup`
+- **Subject:** `fix(db): close recovery fingerprint cursors before migration DDL`
 - **Files to stage:**
-  1. `.github/workflows/ci.yml`
-  2. `docs/T-12 Verification Report.md`
+  1. `apps/api/app/db/recovery.py`
+  2. `apps/api/tests/integration/t12/test_recovery.py`
+  3. `apps/api/tests/unit/test_t12_recovery.py`
+  4. `docs/T-12 Verification Report.md`
 
 ---
 
 ## 10. Final Verification Status
 
-- **Final Verdict:** **T12-CI-FIX-01 CORRECTIVE COMMIT CREATED LOCALLY — READY FOR CONTROLLED PRE-PUSH VERIFICATION**
+- **Final Verdict:** **T12-CI-FIX-02 CORRECTIVE COMMIT CREATED LOCALLY — READY FOR CONTROLLED PRE-PUSH VERIFICATION**
 - **Safety Guarantees Maintained:**
   - Zero modification to migration revisions `0001`, `0002`, or `0003`.
   - Zero modification to RLS policies or PostgreSQL table-level grants.
   - Zero weakening of migration guards (`migration_guard.py`, `gate3b.py`, `gate3b_identity.py`).
+  - Streaming and bounded memory behavior strictly preserved (no `fetchall()`).
+  - Single physical connection, session advisory lock, and outer transaction strictly preserved.
   - Historical T-05 Gate 4 remains `APPROVED`.
   - Neon staging migration remains `BLOCKED`.
   - Render staging deployment remains `BLOCKED`.
